@@ -1,4 +1,4 @@
-#![no_std]
+﻿#![no_std]
 //! # Stow Savings Vault
 //!
 //! Non-custodial savings on Soroban. Funds move only under contract rules.
@@ -16,14 +16,18 @@
 //! and a `TODO(issue)` describing the work. Each stub is one contributor issue.
 
 mod admin;
+mod challenge;
 mod error;
 mod events;
+mod fees;
 mod flexible;
 mod goal;
 mod group;
 mod group_split;
+mod inheritance;
 mod interest;
 mod locked;
+mod multitoken;
 mod storage;
 mod types;
 mod voting;
@@ -199,6 +203,10 @@ impl SavingsVault {
         goal::get_goal(&env, goal_id)
     }
 
+    pub fn goal_contributions(env: Env, goal_id: u64) -> Result<Map<Address, i128>, Error> {
+        goal::get_contributions(&env, goal_id)
+    }
+
     // --- group -------------------------------------------------------------
     pub fn group_create(env: Env, creator: Address, name: String) -> Result<u64, Error> {
         group::create(&env, creator, name)
@@ -331,4 +339,97 @@ impl SavingsVault {
     pub fn interest_accrued(env: Env, owner: Address) -> Result<i128, Error> {
         interest::accrued(&env, owner)
     }
+
+    // --- flexible fee structure (issue #430) ---------------------------------
+
+    /// Return the protocol fee in basis points. Defaults to 0.
+    pub fn fee_bps(env: Env) -> u32 {
+        fees::fee_bps(&env)
+    }
+
+    /// Set the protocol fee. Admin-only. Max 1_000 bps (10%).
+    pub fn set_fee_bps(env: Env, bps: u32) -> Result<(), Error> {
+        fees::set_fee_bps(&env, bps)
+    }
+
+    /// Return the fee recipient address. Defaults to the admin.
+    pub fn fee_recipient(env: Env) -> Result<Address, Error> {
+        fees::fee_recipient(&env)
+    }
+
+    /// Set the fee recipient. Admin-only.
+    pub fn set_fee_recipient(env: Env, recipient: Address) -> Result<(), Error> {
+        fees::set_fee_recipient(&env, recipient)
+    }
+
+    // --- multi-token support (issue #436) ------------------------------------
+
+    /// Return the whitelist of accepted token addresses.
+    pub fn token_whitelist(env: Env) -> soroban_sdk::Vec<Address> {
+        multitoken::get_whitelist(&env)
+    }
+
+    /// Add a token to the whitelist. Admin-only.
+    pub fn add_token(env: Env, token_addr: Address) -> Result<(), Error> {
+        multitoken::add_token(&env, token_addr)
+    }
+
+    /// Remove a token from the whitelist. Admin-only.
+    /// The primary vault token cannot be removed.
+    pub fn remove_token(env: Env, token_addr: Address) -> Result<(), Error> {
+        multitoken::remove_token(&env, token_addr)
+    }
+
+    /// Deposit `amount` of `token_addr` into the caller's multi-token balance.
+    pub fn deposit_token(
+        env: Env,
+        from: Address,
+        token_addr: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        multitoken::deposit_token(&env, from, token_addr, amount)
+    }
+
+    /// Withdraw `amount` of `token_addr` from the caller's multi-token balance.
+    pub fn withdraw_token(
+        env: Env,
+        owner: Address,
+        token_addr: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        multitoken::withdraw_token(&env, owner, token_addr, amount)
+    }
+
+    /// Get a user's per-token balances.
+    pub fn token_balances(env: Env, owner: Address) -> soroban_sdk::Map<Address, i128> {
+        multitoken::get_token_balances(&env, owner)
+    }
+
+    /// Set the conversion rate between two tokens. Admin-only.
+    /// Rate is in 1/1_000_000 units (1_000_000 = 1:1).
+    pub fn set_conversion_rate(
+        env: Env,
+        from: Address,
+        to: Address,
+        rate: u64,
+    ) -> Result<(), Error> {
+        multitoken::set_conversion_rate(&env, from, to, rate)
+    }
+
+    /// Get the conversion rate between two tokens.
+    pub fn conversion_rate(env: Env, from: Address, to: Address) -> Result<u64, Error> {
+        multitoken::get_conversion_rate(&env, &from, &to)
+    }
+
+    /// Convert `amount` of `from_token` to `to_token` in the caller's balance.
+    pub fn convert_balance(
+        env: Env,
+        owner: Address,
+        from_token: Address,
+        to_token: Address,
+        amount: i128,
+    ) -> Result<i128, Error> {
+        multitoken::convert_balance(&env, owner, from_token, to_token, amount)
+    }
 }
+

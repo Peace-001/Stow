@@ -1,4 +1,4 @@
-//! Event topic registry.
+﻿//! Event topic registry.
 //!
 //! The off-chain indexer decodes contract events by topic. This module is
 //! the canonical, compile-checked registry of topic name strings; the full
@@ -55,6 +55,8 @@ pub const TOPIC_GOAL_AUTO_RENEW_SET: &str = "goal_auto_renew_set";
 /// Emitted when claiming an auto-renewing goal restarts it (co-emitted with
 /// `goal_claimed` in the same `goal_claim` call).
 pub const TOPIC_GOAL_RENEWED: &str = "goal_renewed";
+/// Emitted once per contributor during a successful shared-goal claim.
+pub const TOPIC_GOAL_SPLIT_PAID: &str = "goal_split_paid";
 
 // --- group -------------------------------------------------------------
 /// Emitted at the end of a successful `group_create` call.
@@ -100,3 +102,14 @@ pub const TOPIC_INTEREST_WITHDRAW: &str = "interest_withdraw";
 /// Emitted at the end of a successful `interest_claim` call, recording the
 /// interest credited to principal.
 pub const TOPIC_INTEREST_CLAIMED: &str = "interest_claimed";
+
+// --- fees (issue #430) -------------------------------------------------
+pub const TOPIC_FEE_BPS_SET: &str = "fee_bps_set";
+pub const TOPIC_FEE_RECIPIENT_SET: &str = "fee_recipient_set";
+
+// --- multi-token (issue #436) -------------------------------------------
+pub const TOPIC_TOKEN_ADDED: &str = "token_added";
+pub const TOPIC_TOKEN_REMOVED: &str = "token_removed";
+pub const TOPIC_CONVERSION_RATE_SET: &str = "conversion_rate_set";
+pub const TOPIC_BALANCE_CONVERTED: &str = "balance_converted";
+

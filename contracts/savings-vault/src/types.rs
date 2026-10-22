@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Map, String, Vec};
+﻿use soroban_sdk::{contracttype, Address, Map, String, Vec};
 
 /// A flexible savings account: deposit and withdraw any time.
 #[contracttype]
@@ -295,4 +295,32 @@ pub enum DataKey {
     ///
     /// Durability: instance. TTL: same as `InterestRateBps`.
     InterestFrequency,
+    /// Per-contributor amounts for a shared savings goal.
+    GoalContributions(u64),
+    /// Ledger sequence of the most recent contribution to a goal.
+    GoalLastContributionLedger(u64),
+    /// Set while an external token transfer is in progress.
+    TokenTransferActive,
+
+    // ── Issue #430: flexible fee structure ────────────────────────────────
+    /// Protocol fee in basis points (1/100 %). Max 1_000 (10%). Defaults to 0.
+    /// Durability: instance.
+    FeeBps,
+    /// Address that receives protocol fees. Defaults to admin when unset.
+    /// Durability: instance.
+    FeeRecipient,
+
+    // ── Issue #436: multi-token support ────────────────────────────────────
+    /// Whitelist of accepted token addresses. Stored as a Vec<Address>.
+    /// The primary token (set at `initialize`) is always included.
+    /// Durability: instance.
+    TokenWhitelist,
+    /// Per-token flexible balances for a user: Map<token_address, balance>.
+    /// Durability: persistent.
+    TokenBalance(Address),
+    /// Conversion rate from one token to another, in units of 1/1_000_000.
+    /// 1_000_000 = 1:1 parity. Stored per (from, to) pair.
+    /// Durability: instance.
+    ConversionRate(Address, Address),
 }
+
