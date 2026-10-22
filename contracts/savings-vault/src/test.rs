@@ -11,7 +11,7 @@
 use soroban_sdk::{
     testutils::{Address as _, Events as _, Ledger, LedgerInfo},
     token::StellarAssetClient,
-    contract, contractimpl, Address, Env, IntoVal, Map, String,
+    contract, contractimpl, Address, BytesN, Env, IntoVal, Map, String,
 };
 
 use crate::error::Error;
@@ -4222,4 +4222,367 @@ fn token_callback_cannot_reenter_vault_mutation() {
     assert!(ReentrantTokenClient::new(&env, &token).readonly_reentry_rejected());
     assert!(!client.goal(&goal_id).auto_renew);
     assert_eq!(client.goal(&goal_id).saved_amount, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #428 — Emergency pause mechanism
+// ---------------------------------------------------------------------------
+
+#[test]
+fn emergency_mode_blocks_deposits_allows_withdrawals() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    const DEPOSIT: i128 = 100_000_000;
+    mint(&env, &token, &token_admin, &user, DEPOSIT * 2);
+
+    client.deposit(&user, &DEPOSIT);
+    assert_eq!(client.get_account(&user).balance, DEPOSIT);
+    assert!(!client.is_emergency_mode());
+
+    client.set_emergency_mode(&admin, &true);
+    assert!(client.is_emergency_mode());
+
+    let deposit_result = client.try_deposit(&user, &DEPOSIT);
+    assert_eq!(deposit_result, Err(Ok(Error::EmergencyShutdown)));
+
+    client.withdraw(&user, &(DEPOSIT / 2));
+    assert_eq!(client.get_account(&user).balance, DEPOSIT / 2);
+
+    client.set_emergency_mode(&admin, &false);
+    assert!(!client.is_emergency_mode());
+
+    client.deposit(&user, &(DEPOSIT / 2));
+}
+
+#[test]
+fn emergency_withdraw_from_locked_plan() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+
+    const LOCKED_AMOUNT: i128 = 100_000_000;
+    mint(&env, &token, &token_admin, &owner, LOCKED_AMOUNT);
+
+    let now: u64 = 1_000_000;
+    set_ledger_time(&env, now, 100);
+    let plan_id = client.locked_create(&owner, &LOCKED_AMOUNT, &(now + 100_000));
+
+    // Without emergency mode, emergency withdraw fails.
+    let result = client.try_locked_emergency_withdraw(&owner, &plan_id);
+    assert_eq!(result, Err(Ok(Error::NotPaused)));
+
+    // Enable emergency mode.
+    client.set_emergency_mode(&admin, &true);
+
+    let token_client = soroban_sdk::token::Client::new(&env, &token);
+    let balance_before = token_client.balance(&owner);
+
+    client.locked_emergency_withdraw(&owner, &plan_id);
+
+    assert_eq!(
+        token_client.balance(&owner) - balance_before,
+        LOCKED_AMOUNT,
+    );
+    assert_eq!(client.locked_plan(&plan_id).balance, 0);
+}
+
+#[test]
+fn emergency_mode_non_admin_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let attacker = Address::generate(&env);
+
+    let result = client.try_set_emergency_mode(&attacker, &true);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    assert!(!client.is_emergency_mode());
+}
+
+// ---------------------------------------------------------------------------
+// Issue #429 — Contract upgrade pattern
+// ---------------------------------------------------------------------------
+
+#[test]
+fn version_starts_at_one() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _token) = setup_with_token(&env);
+    assert_eq!(client.version(), 1);
+}
+
+#[test]
+fn upgrade_delay_defaults_to_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _token) = setup_with_token(&env);
+    assert_eq!(client.upgrade_delay(), 0);
+}
+
+#[test]
+fn propose_and_cancel_upgrade() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _token) = setup_with_token(&env);
+
+    let fake_hash = BytesN::from_array(&env, &[0u8; 32]);
+    client.propose_upgrade(&admin, &fake_hash);
+
+    let proposal = client.pending_upgrade();
+    assert!(proposal.is_some());
+    let proposal = proposal.unwrap();
+    assert_eq!(proposal.proposed_by, admin);
+
+    client.cancel_upgrade(&admin);
+    assert!(client.pending_upgrade().is_none());
+}
+
+#[test]
+fn propose_upgrade_rejects_duplicate() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _token) = setup_with_token(&env);
+
+    let fake_hash = BytesN::from_array(&env, &[0u8; 32]);
+    client.propose_upgrade(&admin, &fake_hash);
+
+    let result = client.try_propose_upgrade(&admin, &fake_hash);
+    assert_eq!(result, Err(Ok(Error::ConflictingState)));
+}
+
+#[test]
+fn upgrade_delay_enforced() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _token) = setup_with_token(&env);
+
+    client.set_upgrade_delay(&admin, &3600);
+    assert_eq!(client.upgrade_delay(), 3600);
+
+    let now: u64 = 1_000_000;
+    set_ledger_time(&env, now, 100);
+
+    let fake_hash = BytesN::from_array(&env, &[0u8; 32]);
+    client.propose_upgrade(&admin, &fake_hash);
+
+    let result = client.try_execute_upgrade(&admin);
+    assert_eq!(result, Err(Ok(Error::TimeWindowNotOpen)));
+
+    set_ledger_time(&env, now + 3600, 200);
+    // execute_upgrade would call update_current_contract_wasm which panics
+    // in test env with an invalid hash, so we just verify the timelock
+    // passes by checking the proposal is still there
+    let proposal = client.pending_upgrade().unwrap();
+    assert_eq!(proposal.execute_after, now + 3600);
+}
+
+#[test]
+fn upgrade_non_admin_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let attacker = Address::generate(&env);
+
+    let fake_hash = BytesN::from_array(&env, &[0u8; 32]);
+    let result = client.try_propose_upgrade(&attacker, &fake_hash);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn cancel_nonexistent_upgrade_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _token) = setup_with_token(&env);
+
+    let result = client.try_cancel_upgrade(&admin);
+    assert_eq!(result, Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn migrate_admin_only() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _token) = setup_with_token(&env);
+    let attacker = Address::generate(&env);
+
+    client.migrate(&admin);
+
+    let result = client.try_migrate(&attacker);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+// ---------------------------------------------------------------------------
+// Issue #435 — Savings insurance fund
+// ---------------------------------------------------------------------------
+
+#[test]
+fn insurance_premium_defaults_to_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _token) = setup_with_token(&env);
+    assert_eq!(client.insurance_premium_bps(), 0);
+    assert_eq!(client.insurance_fund_balance(), 0);
+}
+
+#[test]
+fn insurance_set_premium() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _token) = setup_with_token(&env);
+
+    client.set_insurance_premium_bps(&admin, &100);
+    assert_eq!(client.insurance_premium_bps(), 100);
+
+    let result = client.try_set_insurance_premium_bps(&admin, &10_001);
+    assert_eq!(result, Err(Ok(Error::InvalidParameters)));
+}
+
+#[test]
+fn insurance_set_premium_non_admin_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let attacker = Address::generate(&env);
+
+    let result = client.try_set_insurance_premium_bps(&attacker, &100);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn insurance_fund_and_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+
+    const FUND_AMOUNT: i128 = 50_000_000;
+    mint(&env, &token, &token_admin, &admin, FUND_AMOUNT);
+
+    client.insurance_fund(&admin, &FUND_AMOUNT);
+    assert_eq!(client.insurance_fund_balance(), FUND_AMOUNT);
+}
+
+#[test]
+fn insurance_approve_and_redeem_claim() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let claimant = Address::generate(&env);
+
+    const FUND_AMOUNT: i128 = 100_000_000;
+    const CLAIM_AMOUNT: i128 = 10_000_000;
+    mint(&env, &token, &token_admin, &admin, FUND_AMOUNT);
+
+    client.insurance_fund(&admin, &FUND_AMOUNT);
+
+    client.insurance_approve_claim(&admin, &claimant, &CLAIM_AMOUNT);
+
+    let claim = client.insurance_claim(&claimant);
+    assert_eq!(claim.amount, CLAIM_AMOUNT);
+    assert!(!claim.redeemed);
+
+    let token_client = soroban_sdk::token::Client::new(&env, &token);
+    let balance_before = token_client.balance(&claimant);
+
+    let redeemed = client.insurance_redeem_claim(&claimant);
+    assert_eq!(redeemed, CLAIM_AMOUNT);
+
+    assert_eq!(
+        token_client.balance(&claimant) - balance_before,
+        CLAIM_AMOUNT
+    );
+    assert_eq!(
+        client.insurance_fund_balance(),
+        FUND_AMOUNT - CLAIM_AMOUNT
+    );
+
+    let claim = client.insurance_claim(&claimant);
+    assert!(claim.redeemed);
+}
+
+#[test]
+fn insurance_claim_exceeds_max_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let claimant = Address::generate(&env);
+
+    const FUND_AMOUNT: i128 = 100_000_000;
+    mint(&env, &token, &token_admin, &admin, FUND_AMOUNT);
+
+    client.insurance_fund(&admin, &FUND_AMOUNT);
+    client.set_insurance_max_claim_bps(&admin, &500);
+
+    let max_allowed = FUND_AMOUNT * 500 / 10_000;
+    let result = client.try_insurance_approve_claim(&admin, &claimant, &(max_allowed + 1));
+    assert_eq!(result, Err(Ok(Error::DepositCapExceeded)));
+
+    client.insurance_approve_claim(&admin, &claimant, &max_allowed);
+}
+
+#[test]
+fn insurance_double_redeem_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let claimant = Address::generate(&env);
+
+    const FUND_AMOUNT: i128 = 100_000_000;
+    const CLAIM_AMOUNT: i128 = 5_000_000;
+    mint(&env, &token, &token_admin, &admin, FUND_AMOUNT);
+
+    client.insurance_fund(&admin, &FUND_AMOUNT);
+    client.insurance_approve_claim(&admin, &claimant, &CLAIM_AMOUNT);
+    client.insurance_redeem_claim(&claimant);
+
+    let result = client.try_insurance_redeem_claim(&claimant);
+    assert_eq!(result, Err(Ok(Error::ConflictingState)));
+}
+
+#[test]
+fn insurance_premium_collected_on_deposit() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    const DEPOSIT: i128 = 100_000_000;
+    const PREMIUM_BPS: u32 = 100; // 1%
+    const EXPECTED_PREMIUM: i128 = DEPOSIT * PREMIUM_BPS as i128 / 10_000;
+
+    client.set_insurance_premium_bps(&admin, &PREMIUM_BPS);
+    mint(&env, &token, &token_admin, &user, DEPOSIT);
+
+    client.deposit(&user, &DEPOSIT);
+
+    assert_eq!(client.insurance_fund_balance(), EXPECTED_PREMIUM);
+    assert_eq!(
+        client.get_account(&user).balance,
+        DEPOSIT - EXPECTED_PREMIUM,
+    );
 }

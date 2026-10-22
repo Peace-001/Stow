@@ -102,3 +102,25 @@ pub const TOPIC_INTEREST_WITHDRAW: &str = "interest_withdraw";
 /// Emitted at the end of a successful `interest_claim` call, recording the
 /// interest credited to principal.
 pub const TOPIC_INTEREST_CLAIMED: &str = "interest_claimed";
+
+// --- emergency pause (#428) -----------------------------------------------
+/// Emitted when the contract enters or exits emergency mode.
+pub const TOPIC_EMERGENCY_MODE_SET: &str = "emergency_mode_set";
+/// Emitted on a successful emergency withdrawal.
+pub const TOPIC_EMERGENCY_WITHDRAW: &str = "emergency_withdraw";
+
+// --- contract upgrade (#429) ----------------------------------------------
+/// Emitted when an upgrade is proposed.
+pub const TOPIC_UPGRADE_PROPOSED: &str = "upgrade_proposed";
+/// Emitted when a pending upgrade is cancelled.
+pub const TOPIC_UPGRADE_CANCELLED: &str = "upgrade_cancelled";
+
+// --- insurance fund (#435) ------------------------------------------------
+/// Emitted when the insurance premium rate changes.
+pub const TOPIC_INSURANCE_PREMIUM_SET: &str = "insurance_premium_set";
+/// Emitted when funds are added to the insurance pool.
+pub const TOPIC_INSURANCE_FUNDED: &str = "insurance_funded";
+/// Emitted when an insurance claim is approved.
+pub const TOPIC_INSURANCE_CLAIM_APPROVED: &str = "insurance_claim_approved";
+/// Emitted when an insurance claim is redeemed.
+pub const TOPIC_INSURANCE_CLAIM_REDEEMED: &str = "insurance_claim_redeemed";
