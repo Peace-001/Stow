@@ -9,6 +9,7 @@
 //! the bare contract shell (no token) can still call [`setup`].
 
 use soroban_sdk::{
+    contract, contractclient, contractimpl,
     testutils::{Address as _, Events as _, Ledger, LedgerInfo},
     token::StellarAssetClient,
     Address, Env, IntoVal, Map, String,
@@ -19,6 +20,67 @@ use crate::events::{TOPIC_DEPOSIT, TOPIC_WITHDRAW};
 use crate::group_split;
 use crate::types::CompoundFrequency;
 use crate::{SavingsVault, SavingsVaultClient};
+
+#[contract]
+struct ReentrantToken;
+
+#[contractimpl]
+impl ReentrantToken {
+    pub fn configure(env: Env, vault: Address, owner: Address, goal_id: u64) {
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("vault"), &vault);
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("owner"), &owner);
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("goalid"), &goal_id);
+    }
+
+    pub fn transfer(env: Env, _from: Address, _to: Address, _amount: i128) {
+        let vault: Address = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("vault"))
+            .unwrap();
+        let owner: Address = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("owner"))
+            .unwrap();
+        let goal_id: u64 = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("goalid"))
+            .unwrap();
+        let result =
+            SavingsVaultClient::new(&env, &vault).try_goal_set_auto_renew(&owner, &goal_id, &true);
+        let rejected = matches!(result, Err(Ok(Error::ReentrantCall)));
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("rejected"), &rejected);
+        let read_result = SavingsVaultClient::new(&env, &vault).try_goal(&goal_id);
+        let read_rejected = matches!(read_result, Err(Ok(Error::ReentrantCall)));
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("read_rej"), &read_rejected);
+    }
+
+    pub fn reentry_rejected(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("rejected"))
+            .unwrap_or(false)
+    }
+
+    pub fn readonly_reentry_rejected(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("read_rej"))
+            .unwrap_or(false)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -69,6 +131,10 @@ fn set_ledger_time(env: &Env, timestamp: u64, sequence_number: u32) {
     });
 }
 
+fn advance_ledger(env: &Env) {
+    set_ledger_time(env, env.ledger().timestamp(), env.ledger().sequence() + 1);
+}
+
 // ---------------------------------------------------------------------------
 // Existing placeholder stubs
 // ---------------------------------------------------------------------------
@@ -98,6 +164,34 @@ fn flexible_deposit_withdraw() {
     assert_eq!(
         client.try_get_account(&Address::generate(&env)),
         Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn flexible_deposit_gas_cost_stays_within_baseline() {
+    const CPU_BASELINE: u64 = 20_000_000;
+    const MEMORY_BASELINE: u64 = 4 * 1024 * 1024;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    mint(&env, &token, &token_admin, &owner, 1_000);
+
+    let mut budget = env.budget();
+    budget.reset_default();
+    client.deposit(&owner, &1_000);
+
+    let cpu_cost = budget.cpu_instruction_cost();
+    let memory_cost = budget.memory_bytes_cost();
+    assert!(
+        cpu_cost <= CPU_BASELINE,
+        "flexible deposit CPU cost {cpu_cost} exceeds baseline {CPU_BASELINE}",
+    );
+    assert!(
+        memory_cost <= MEMORY_BASELINE,
+        "flexible deposit memory cost {memory_cost} exceeds baseline {MEMORY_BASELINE}",
     );
 }
 
@@ -223,6 +317,7 @@ fn goal_claim_after_reached_returns_funds() {
     let token_client = soroban_sdk::token::Client::new(&env, &token);
     let owner_balance_before_claim = token_client.balance(&owner);
 
+    advance_ledger(&env);
     client.goal_claim(&owner, &goal_id);
 
     let owner_balance_after_claim = token_client.balance(&owner);
@@ -235,6 +330,49 @@ fn goal_claim_after_reached_returns_funds() {
     // The goal is closed on claim; a second claim finds nothing to pay out.
     let result = client.try_goal_claim(&owner, &goal_id);
     assert_eq!(result, Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn shared_goal_tracks_contributions_and_splits_claim() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let contributor = Address::generate(&env);
+    const OWNER_AMOUNT: i128 = 60_000_000;
+    const CONTRIBUTOR_AMOUNT: i128 = 40_000_000;
+    const TOTAL: i128 = OWNER_AMOUNT + CONTRIBUTOR_AMOUNT;
+
+    mint(&env, &token, &token_admin, &owner, OWNER_AMOUNT);
+    mint(&env, &token, &token_admin, &contributor, CONTRIBUTOR_AMOUNT);
+    let goal_id = client.goal_create(&owner, &String::from_str(&env, "shared"), &TOTAL);
+    client.goal_contribute(&owner, &goal_id, &OWNER_AMOUNT);
+    client.goal_contribute(&contributor, &goal_id, &CONTRIBUTOR_AMOUNT);
+
+    let contributions = client.goal_contributions(&goal_id);
+    assert_eq!(contributions.get(owner.clone()), Some(OWNER_AMOUNT));
+    assert_eq!(
+        contributions.get(contributor.clone()),
+        Some(CONTRIBUTOR_AMOUNT)
+    );
+
+    let token_client = soroban_sdk::token::Client::new(&env, &token);
+    let owner_before = token_client.balance(&owner);
+    let contributor_before = token_client.balance(&contributor);
+    assert_eq!(
+        client.try_goal_claim(&owner, &goal_id),
+        Err(Ok(Error::SameLedger))
+    );
+    advance_ledger(&env);
+    client.goal_claim(&owner, &goal_id);
+
+    assert_eq!(token_client.balance(&owner) - owner_before, OWNER_AMOUNT);
+    assert_eq!(
+        token_client.balance(&contributor) - contributor_before,
+        CONTRIBUTOR_AMOUNT
+    );
 }
 
 /// An unreached goal cannot be claimed and remains intact.
@@ -289,6 +427,7 @@ fn goal_auto_renew_restarts_on_claim() {
     let token_client = soroban_sdk::token::Client::new(&env, &token);
     let balance_before = token_client.balance(&owner);
 
+    advance_ledger(&env);
     client.goal_claim(&owner, &goal_id);
 
     assert_eq!(
@@ -303,6 +442,7 @@ fn goal_auto_renew_restarts_on_claim() {
         renewed.reached_at.is_none(),
         "renewed goal clears its reached milestone"
     );
+    assert!(client.goal_contributions(&goal_id).is_empty());
     assert!(renewed.auto_renew, "renewal setting is retained");
     assert_eq!(renewed.target_amount, TARGET, "target is preserved");
 
@@ -310,6 +450,11 @@ fn goal_auto_renew_restarts_on_claim() {
     // time, proving the restart is a full cycle rather than a one-off.
     client.goal_contribute(&owner, &goal_id, &TARGET);
     assert!(client.goal(&goal_id).reached_at.is_some());
+    assert_eq!(
+        client.goal_contributions(&goal_id).get(owner.clone()),
+        Some(TARGET)
+    );
+    advance_ledger(&env);
     client.goal_claim(&owner, &goal_id);
     assert_eq!(client.goal(&goal_id).saved_amount, 0);
 }
@@ -332,6 +477,7 @@ fn goal_auto_renew_can_be_disabled_again() {
     client.goal_set_auto_renew(&owner, &goal_id, &true);
     client.goal_set_auto_renew(&owner, &goal_id, &false);
     client.goal_contribute(&owner, &goal_id, &TARGET);
+    advance_ledger(&env);
     client.goal_claim(&owner, &goal_id);
 
     // Renewal was switched back off, so the goal closes on claim.
@@ -2245,6 +2391,7 @@ fn goal_claim_auto_renew_emits_goal_renewed_event() {
     client.goal_set_auto_renew(&owner, &goal_id, &true);
     client.goal_contribute(&owner, &goal_id, &TARGET);
 
+    advance_ledger(&env);
     client.goal_claim(&owner, &goal_id);
 
     let now = env.ledger().timestamp();
@@ -3542,6 +3689,28 @@ mod group_split_properties {
 
             prop_assert_eq!(sum, pool, "sum of payouts must equal the pool exactly");
         }
+
+        #[test]
+        fn goal_split_rounding_sums_to_pool(
+            contributions in proptest::collection::vec(1i128..=1_000_000i128, 1..=8),
+            pool in 0i128..=1_000_000_000_000i128,
+        ) {
+            let env = Env::default();
+            let owner = Address::generate(&env);
+            let mut amounts = Map::new(&env);
+            for amount in contributions {
+                let contributor = Address::generate(&env);
+                amounts.set(contributor, amount);
+            }
+
+            let payouts = crate::goal::compute_payouts(&env, &amounts, pool, &owner).unwrap();
+            let mut sum = 0i128;
+            for (_contributor, amount) in payouts.iter() {
+                prop_assert!(amount >= 0);
+                sum += amount;
+            }
+            prop_assert_eq!(sum, pool);
+        }
     }
 }
 
@@ -4098,4 +4267,28 @@ fn reward_fund_emits_event() {
         events_after > events_before,
         "reward_fund must emit an event"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Upstream #491 — Token reentrancy guard
+// ---------------------------------------------------------------------------
+
+#[test]
+fn token_callback_cannot_reenter_vault_mutation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let admin = Address::generate(&env);
+    let token = env.register(ReentrantToken, ());
+    client.initialize(&admin, &token);
+    let owner = Address::generate(&env);
+    let goal_id = client.goal_create(&owner, &String::from_str(&env, "guard"), &2);
+    ReentrantTokenClient::new(&env, &token).configure(&client.address, &owner, &goal_id);
+
+    client.goal_contribute(&owner, &goal_id, &1);
+
+    assert!(ReentrantTokenClient::new(&env, &token).reentry_rejected());
+    assert!(ReentrantTokenClient::new(&env, &token).readonly_reentry_rejected());
+    assert!(!client.goal(&goal_id).auto_renew);
+    assert_eq!(client.goal(&goal_id).saved_amount, 1);
 }

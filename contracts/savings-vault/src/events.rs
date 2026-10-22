@@ -55,6 +55,8 @@ pub const TOPIC_GOAL_AUTO_RENEW_SET: &str = "goal_auto_renew_set";
 /// Emitted when claiming an auto-renewing goal restarts it (co-emitted with
 /// `goal_claimed` in the same `goal_claim` call).
 pub const TOPIC_GOAL_RENEWED: &str = "goal_renewed";
+/// Emitted once per contributor during a successful shared-goal claim.
+pub const TOPIC_GOAL_SPLIT_PAID: &str = "goal_split_paid";
 
 // --- group -------------------------------------------------------------
 /// Emitted at the end of a successful `group_create` call.

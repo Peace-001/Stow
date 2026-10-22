@@ -226,6 +226,10 @@ impl SavingsVault {
         goal::get_goal(&env, goal_id)
     }
 
+    pub fn goal_contributions(env: Env, goal_id: u64) -> Result<Map<Address, i128>, Error> {
+        goal::get_contributions(&env, goal_id)
+    }
+
     // --- group -------------------------------------------------------------
     pub fn group_create(env: Env, creator: Address, name: String) -> Result<u64, Error> {
         group::create(&env, creator, name)
