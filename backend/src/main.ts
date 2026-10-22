@@ -4,6 +4,7 @@ import { ConfigService } from '@nestjs/config';
 import { AppModule } from './app.module';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
 import { ResponseInterceptor } from './common/interceptors/response.interceptor';
+import { CompressionMiddleware } from './common/middleware/compression.middleware';
 
 import { Logger } from 'nestjs-pino';
 
@@ -17,6 +18,10 @@ async function bootstrap() {
     rawBody: true,
   });
   app.useLogger(app.get(Logger));
+
+  // Apply compression middleware
+  const compressionMiddleware = new CompressionMiddleware();
+  app.use(compressionMiddleware.use.bind(compressionMiddleware));
 
   // Credentials cannot be used with a wildcard origin. Keep the allowlist
   // explicit and configurable for local, staging, and production frontends.
