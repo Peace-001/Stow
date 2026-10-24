@@ -344,3 +344,4 @@ pub enum DataKey {
     /// Approved insurance claim by user address.
     InsuranceClaim(Address),
 }
+

@@ -1,4 +1,4 @@
-#![no_std]
+﻿#![no_std]
 //! # Stow Savings Vault
 //!
 //! Non-custodial savings on Soroban. Funds move only under contract rules.
@@ -24,6 +24,7 @@ mod group;
 mod group_split;
 mod insurance;
 mod interest;
+mod challenge;
 mod locked;
 mod storage;
 mod types;
@@ -451,3 +452,4 @@ impl SavingsVault {
         insurance::get_claim(&env, claimant)
     }
 }
+

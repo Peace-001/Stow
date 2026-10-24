@@ -1,4 +1,4 @@
-//! Event topic registry.
+﻿//! Event topic registry.
 //!
 //! The off-chain indexer decodes contract events by topic. This module is
 //! the canonical, compile-checked registry of topic name strings; the full
