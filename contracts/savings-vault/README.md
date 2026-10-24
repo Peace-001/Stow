@@ -412,6 +412,9 @@ stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
 #### `goal_contribute(from: Address, goal_id: u64, amount: i128) -> Result<(), Error>`
 - **Auth:** `from`.
 - **Errors:** `NotFound`, `InvalidAmount`.
+- **Note:** contributors share ownership of the goal balance in proportion to
+  their cumulative contributions; contribution history is available through
+  `goal_contributions`.
 - **Events:** [`goal_contribution`](#goal_contribution), plus
   [`goal_reached`](#goal_reached) the call that first crosses `target_amount`.
 ```bash
@@ -422,8 +425,9 @@ stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
 #### `goal_claim(owner: Address, goal_id: u64) -> Result<(), Error>`
 - **Auth:** `owner`.
 - **Errors:** `NotFound`, `Unauthorized`, `GoalNotReached` if `reached_at`
-  is unset.
+  is unset, `SameLedger` if a contribution was made in the current ledger.
 - **Events:** [`goal_claimed`](#goal_claimed), plus
+  [`goal_split_paid`](#goal_split_paid) for each contributor and
   [`goal_renewed`](#goal_renewed) when the goal has `auto_renew` enabled.
 - **Note:** when `auto_renew` is enabled, the goal is restarted instead of
   closed — `saved_amount` resets to 0 and `reached_at` clears, keeping the
@@ -452,6 +456,11 @@ stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
 stellar contract invoke --id $CONTRACT_ID --source alice --network testnet \
   -- goal --goal_id 1
 ```
+
+#### `goal_contributions(goal_id: u64) -> Result<Map<Address, i128>, Error>`
+- **Auth:** none (read-only).
+- **Errors:** `NotFound`.
+- **Returns:** cumulative contribution amounts by contributor.
 
 ### Group savings — shared pools, equal payout
 
@@ -920,6 +929,20 @@ Topics: `(Symbol("goal_claimed"), owner: Address, id: u64)`
 | `id` | `u64` | Goal id. |
 | `owner` | `Address` | Goal owner. |
 | `amount` | `i128` | Amount transferred out (full saved balance). |
+| `timestamp` | `u64` | Ledger timestamp of the call. |
+
+#### `goal_split_paid`
+Topics: `(Symbol("goal_split_paid"), contributor: Address, id: u64)`
+
+Emitted once for each contributor paid by `goal_claim`; the payout is
+proportional to cumulative contributions, with rounding remainder assigned
+to the goal owner.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` | `u64` | Goal id. |
+| `contributor` | `Address` | Payout recipient. |
+| `amount` | `i128` | Amount paid to the contributor. |
 | `timestamp` | `u64` | Ledger timestamp of the call. |
 
 #### `goal_auto_renew_set`

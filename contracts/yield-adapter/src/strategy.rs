@@ -26,15 +26,40 @@ const STRATEGY_FN_DEPOSIT: &str = "deposit";
 const STRATEGY_FN_WITHDRAW: &str = "withdraw";
 const STRATEGY_FN_BALANCE: &str = "balance";
 
+/// Maximum number of items accepted by `batch_deposit`. Prevents a single
+/// transaction from exhausting Soroban's per-transaction resource limits.
+/// Callers submitting more than this many items receive `Error::BatchTooLarge`.
+pub const MAX_BATCH_SIZE: u32 = 10;
+
 /// The adapter's claim on `strategy`, as reported by `strategy.balance(adapter)`.
 ///
+/// Returns `Err(Error::StrategyCallFailed)` if the strategy contract panics
+/// or returns a contract error, rather than propagating an untyped host trap.
 /// A negative report is nonsensical (the adapter can't owe a strategy
 /// anything) and is clamped to `0` rather than trusted.
-pub fn strategy_balance(env: &Env, strategy: &Address) -> i128 {
+pub fn strategy_balance(env: &Env, strategy: &Address) -> Result<i128, Error> {
     let args: Vec<Val> = vec![env, env.current_contract_address().into_val(env)];
-    let reported: i128 =
-        env.invoke_contract(strategy, &Symbol::new(env, STRATEGY_FN_BALANCE), args);
-    reported.max(0)
+    // try_invoke_contract<T, E>: T = return value type, E = contract error type.
+    // We use soroban_sdk::Error as E so any contract-error variant maps through
+    // the outer Result without needing to name the strategy's own error enum.
+    let reported: i128 = env
+        .try_invoke_contract::<i128, soroban_sdk::Error>(
+            strategy,
+            &Symbol::new(env, STRATEGY_FN_BALANCE),
+            args,
+        )
+        .map_err(|_| Error::StrategyCallFailed)? // outer Err = host InvokeError
+        .map_err(|_| Error::StrategyCallFailed)?; // inner Err = contract error
+    Ok(reported.max(0))
+}
+
+/// Infallible wrapper around [`strategy_balance`] that returns `0` on any
+/// strategy error. Used by `accounting::active_strategy_balance` where the
+/// caller cannot propagate a `Result` (the public `total_assets` entrypoint
+/// is infallible-typed). Internal callers that *can* propagate errors should
+/// call [`strategy_balance`] directly.
+pub fn strategy_balance_or_zero(env: &Env, strategy: &Address) -> i128 {
+    strategy_balance(env, strategy).unwrap_or(0)
 }
 
 /// Move `amount` of the vault token from the adapter into `strategy` by
@@ -45,6 +70,10 @@ pub fn strategy_balance(env: &Env, strategy: &Address) -> i128 {
 /// the adapter doesn't make directly, so the adapter pre-authorizes exactly
 /// that one transfer via `authorize_as_current_contract` — the strategy
 /// cannot use it to move any other amount or to any other recipient.
+///
+/// Returns `Err(Error::StrategyCallFailed)` if the strategy contract panics
+/// or returns a contract error, preserving a typed error instead of an
+/// untyped host trap.
 pub fn deploy_to_strategy(env: &Env, strategy: &Address, amount: i128) -> Result<(), Error> {
     if amount <= 0 {
         return Err(Error::InvalidAmount);
@@ -65,7 +94,13 @@ pub fn deploy_to_strategy(env: &Env, strategy: &Address, amount: i128) -> Result
     ]);
 
     let args: Vec<Val> = vec![env, adapter.into_val(env), amount.into_val(env)];
-    env.invoke_contract::<()>(strategy, &Symbol::new(env, STRATEGY_FN_DEPOSIT), args);
+    env.try_invoke_contract::<(), soroban_sdk::Error>(
+        strategy,
+        &Symbol::new(env, STRATEGY_FN_DEPOSIT),
+        args,
+    )
+    .map_err(|_| Error::StrategyCallFailed)?
+    .map_err(|_| Error::StrategyCallFailed)?;
     Ok(())
 }
 
@@ -73,6 +108,9 @@ pub fn deploy_to_strategy(env: &Env, strategy: &Address, amount: i128) -> Result
 /// `strategy.withdraw(adapter, amount)`, and return how much actually
 /// arrived (measured from the adapter's own token balance, not trusted from
 /// the strategy).
+///
+/// Returns `Err(Error::StrategyCallFailed)` if the strategy contract panics
+/// or returns a contract error.
 pub fn withdraw_from_strategy(env: &Env, strategy: &Address, amount: i128) -> Result<i128, Error> {
     if amount <= 0 {
         return Err(Error::InvalidAmount);
@@ -81,7 +119,13 @@ pub fn withdraw_from_strategy(env: &Env, strategy: &Address, amount: i128) -> Re
     let before = storage::idle_balance(env);
 
     let args: Vec<Val> = vec![env, adapter.into_val(env), amount.into_val(env)];
-    env.invoke_contract::<()>(strategy, &Symbol::new(env, STRATEGY_FN_WITHDRAW), args);
+    env.try_invoke_contract::<(), soroban_sdk::Error>(
+        strategy,
+        &Symbol::new(env, STRATEGY_FN_WITHDRAW),
+        args,
+    )
+    .map_err(|_| Error::StrategyCallFailed)?
+    .map_err(|_| Error::StrategyCallFailed)?;
 
     let after = storage::idle_balance(env);
     after.checked_sub(before).ok_or(Error::Overflow)
@@ -100,9 +144,12 @@ pub fn active_strategy(env: &Env) -> Option<StrategyInfo> {
 }
 
 /// The adapter's claim on the active strategy (`0` with no active strategy).
+/// Uses [`strategy_balance_or_zero`] so callers that cannot propagate a
+/// `Result` (e.g. the infallible `total_assets` entrypoint) still get a
+/// safe value rather than a host trap when the strategy is unresponsive.
 pub fn active_strategy_balance(env: &Env) -> i128 {
     match active_strategy(env) {
-        Some(info) => strategy_balance(env, &info.address),
+        Some(info) => strategy_balance_or_zero(env, &info.address),
         None => 0,
     }
 }
@@ -290,7 +337,7 @@ pub fn migrate_strategy(env: &Env, caller: Address, new_strategy_id: u64) -> Res
     }
     let old_info = get_strategy(env, old_id)?;
 
-    let deployed = strategy_balance(env, &old_info.address);
+    let deployed = strategy_balance(env, &old_info.address)?;
     let moved = if deployed > 0 {
         withdraw_from_strategy(env, &old_info.address, deployed)?
     } else {

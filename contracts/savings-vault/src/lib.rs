@@ -22,7 +22,7 @@ mod flexible;
 mod goal;
 mod group;
 mod group_split;
-mod inheritance;
+mod insurance;
 mod interest;
 mod challenge;
 mod locked;
@@ -37,8 +37,8 @@ use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, Map, String};
 
 use crate::error::Error;
 use crate::types::{
-    Challenge, CompoundFrequency, FlexibleAccount, Goal, Group, InheritancePlan, InterestAccount,
-    LockedPlan, Proposal,
+    CompoundFrequency, FlexibleAccount, Goal, Group, InsuranceClaimRecord, InterestAccount,
+    LockedPlan, Proposal, UpgradeProposal,
 };
 
 #[contract]
@@ -202,6 +202,10 @@ impl SavingsVault {
         goal::get_goal(&env, goal_id)
     }
 
+    pub fn goal_contributions(env: Env, goal_id: u64) -> Result<Map<Address, i128>, Error> {
+        goal::get_contributions(&env, goal_id)
+    }
+
     // --- group -------------------------------------------------------------
     pub fn group_create(env: Env, creator: Address, name: String) -> Result<u64, Error> {
         group::create(&env, creator, name)
@@ -335,105 +339,117 @@ impl SavingsVault {
         interest::accrued(&env, owner)
     }
 
-    // --- inheritance (issue #439) -------------------------------------------
+    // --- emergency mode (#428) --------------------------------------------
 
-    /// Designate a beneficiary for the caller's flexible savings balance.
-    ///
-    /// Creates the inheritance plan on the first call. Pass `share_bps` in
-    /// basis points (1–10_000). To enable claiming, all beneficiary shares must
-    /// sum to exactly 10_000 and an inactivity timeout must be configured.
-    pub fn designate_beneficiary(
+    /// Activate or deactivate emergency mode. Admin-only.
+    /// In emergency mode only withdrawals are permitted.
+    pub fn set_emergency_mode(env: Env, caller: Address, active: bool) -> Result<(), Error> {
+        admin::set_emergency_mode(&env, caller, active)
+    }
+
+    /// Whether the contract is in emergency mode.
+    pub fn is_emergency_mode(env: Env) -> bool {
+        admin::is_emergency_mode(&env)
+    }
+
+    /// Emergency withdrawal from a locked plan. Bypasses the timelock,
+    /// no penalty. Only available during emergency mode.
+    pub fn locked_emergency_withdraw(env: Env, owner: Address, plan_id: u64) -> Result<(), Error> {
+        locked::emergency_withdraw(&env, owner, plan_id)
+    }
+
+    // --- contract upgrade pattern (#429) ----------------------------------
+
+    /// The current contract version number.
+    pub fn version(env: Env) -> u32 {
+        admin::version(&env)
+    }
+
+    /// The configured upgrade delay in seconds.
+    pub fn upgrade_delay(env: Env) -> u64 {
+        admin::upgrade_delay(&env)
+    }
+
+    /// Set the minimum delay before a proposed upgrade can execute.
+    pub fn set_upgrade_delay(env: Env, caller: Address, seconds: u64) -> Result<(), Error> {
+        admin::set_upgrade_delay(&env, caller, seconds)
+    }
+
+    /// Propose an upgrade with a timelock delay.
+    pub fn propose_upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        admin::propose_upgrade(&env, caller, new_wasm_hash)
+    }
+
+    /// Execute a pending upgrade after the timelock elapses.
+    pub fn execute_upgrade(env: Env, caller: Address) -> Result<(), Error> {
+        admin::execute_upgrade(&env, caller)
+    }
+
+    /// Cancel a pending upgrade.
+    pub fn cancel_upgrade(env: Env, caller: Address) -> Result<(), Error> {
+        admin::cancel_upgrade(&env, caller)
+    }
+
+    /// Read the pending upgrade proposal, if any.
+    pub fn pending_upgrade(env: Env) -> Option<UpgradeProposal> {
+        admin::pending_upgrade(&env)
+    }
+
+    /// Run post-upgrade state migration. Admin-only.
+    pub fn migrate(env: Env, caller: Address) -> Result<(), Error> {
+        admin::migrate(&env, caller)
+    }
+
+    // --- insurance fund (#435) --------------------------------------------
+
+    /// The insurance premium rate in basis points.
+    pub fn insurance_premium_bps(env: Env) -> u32 {
+        insurance::premium_bps(&env)
+    }
+
+    /// Set the insurance premium rate. Admin-only.
+    pub fn set_insurance_premium_bps(env: Env, caller: Address, bps: u32) -> Result<(), Error> {
+        insurance::set_premium_bps(&env, caller, bps)
+    }
+
+    /// The current insurance fund balance.
+    pub fn insurance_fund_balance(env: Env) -> i128 {
+        insurance::fund_balance(&env)
+    }
+
+    /// Add funds to the insurance pool. Admin-only.
+    pub fn insurance_fund(env: Env, caller: Address, amount: i128) -> Result<(), Error> {
+        insurance::fund(&env, caller, amount)
+    }
+
+    /// The maximum per-claim amount in basis points of fund balance.
+    pub fn insurance_max_claim_bps(env: Env) -> u32 {
+        insurance::max_claim_bps(&env)
+    }
+
+    /// Set the maximum per-claim basis points. Admin-only.
+    pub fn set_insurance_max_claim_bps(env: Env, caller: Address, bps: u32) -> Result<(), Error> {
+        insurance::set_max_claim_bps(&env, caller, bps)
+    }
+
+    /// Approve an insurance claim. Admin-only.
+    pub fn insurance_approve_claim(
         env: Env,
-        owner: Address,
-        beneficiary: Address,
-        share_bps: u32,
-    ) -> Result<(), Error> {
-        inheritance::designate_beneficiary(&env, owner, beneficiary, share_bps)
-    }
-
-    /// Remove a beneficiary from the caller's inheritance plan.
-    pub fn remove_beneficiary(
-        env: Env,
-        owner: Address,
-        beneficiary: Address,
-    ) -> Result<(), Error> {
-        inheritance::remove_beneficiary(&env, owner, beneficiary)
-    }
-
-    /// Set the inactivity timeout (in seconds) for the caller's inheritance plan.
-    ///
-    /// Once `now >= last_active_at + timeout` and beneficiary shares sum to
-    /// 10_000, any beneficiary may call `claim_inheritance`. Setting `0`
-    /// disables automatic inheritance.
-    pub fn set_inactivity_timeout(
-        env: Env,
-        owner: Address,
-        timeout_seconds: u64,
-    ) -> Result<(), Error> {
-        inheritance::set_inactivity_timeout(&env, owner, timeout_seconds)
-    }
-
-    /// Claim the inheritance of `owner`'s flexible balance.
-    ///
-    /// Succeeds when: a plan exists, the inactivity timeout has elapsed,
-    /// beneficiary shares sum to 10_000, and `claimer` is a designated
-    /// beneficiary. Each beneficiary receives their proportional share.
-    pub fn claim_inheritance(env: Env, claimer: Address, owner: Address) -> Result<(), Error> {
-        inheritance::claim_inheritance(&env, claimer, owner)
-    }
-
-    /// Read the inheritance plan for `owner`.
-    pub fn get_inheritance_plan(env: Env, owner: Address) -> Result<InheritancePlan, Error> {
-        inheritance::get_plan(&env, owner)
-    }
-
-    // --- challenges (issue #442) ---------------------------------------------
-
-    /// Create a new savings challenge.
-    ///
-    /// `creator` becomes the first participant and pays the `entry_fee`.
-    /// Returns the challenge id.
-    pub fn create_challenge(
-        env: Env,
-        creator: Address,
-        target_amount: i128,
-        entry_fee: i128,
-        deadline: u64,
-        min_participants: u32,
-    ) -> Result<u64, Error> {
-        challenge::create(&env, creator, target_amount, entry_fee, deadline, min_participants)
-    }
-
-    /// Join a savings challenge and pay the entry fee.
-    pub fn join_challenge(env: Env, participant: Address, challenge_id: u64) -> Result<(), Error> {
-        challenge::join(&env, participant, challenge_id)
-    }
-
-    /// Deposit savings toward the caller's target within a challenge.
-    pub fn save_challenge(
-        env: Env,
-        participant: Address,
-        challenge_id: u64,
+        caller: Address,
+        claimant: Address,
         amount: i128,
     ) -> Result<(), Error> {
-        challenge::save(&env, participant, challenge_id, amount)
+        insurance::approve_claim(&env, caller, claimant, amount)
     }
 
-    /// Verify on-chain that the caller has reached the target and claim the
-    /// prize pool.
-    pub fn claim_winner(env: Env, participant: Address, challenge_id: u64) -> Result<(), Error> {
-        challenge::claim_winner(&env, participant, challenge_id)
+    /// Redeem an approved insurance claim.
+    pub fn insurance_redeem_claim(env: Env, claimant: Address) -> Result<i128, Error> {
+        insurance::redeem_claim(&env, claimant)
     }
 
-    /// Refund all entry fees after the deadline has passed without a winner.
-    /// Permissionless — any address may trigger.
-    pub fn refund_expired(env: Env, caller: Address, challenge_id: u64) -> Result<(), Error> {
-        challenge::refund_expired(&env, caller, challenge_id)
-    }
-
-    /// Read a challenge by id.
-    pub fn get_challenge(env: Env, challenge_id: u64) -> Result<Challenge, Error> {
-        challenge::get_challenge(&env, challenge_id)
+    /// Read an insurance claim record.
+    pub fn insurance_claim(env: Env, claimant: Address) -> Result<InsuranceClaimRecord, Error> {
+        insurance::get_claim(&env, claimant)
     }
 }
 

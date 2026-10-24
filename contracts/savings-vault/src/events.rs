@@ -55,6 +55,8 @@ pub const TOPIC_GOAL_AUTO_RENEW_SET: &str = "goal_auto_renew_set";
 /// Emitted when claiming an auto-renewing goal restarts it (co-emitted with
 /// `goal_claimed` in the same `goal_claim` call).
 pub const TOPIC_GOAL_RENEWED: &str = "goal_renewed";
+/// Emitted once per contributor during a successful shared-goal claim.
+pub const TOPIC_GOAL_SPLIT_PAID: &str = "goal_split_paid";
 
 // --- group -------------------------------------------------------------
 /// Emitted at the end of a successful `group_create` call.
@@ -101,25 +103,24 @@ pub const TOPIC_INTEREST_WITHDRAW: &str = "interest_withdraw";
 /// interest credited to principal.
 pub const TOPIC_INTEREST_CLAIMED: &str = "interest_claimed";
 
-// --- inheritance (issue #439) ------------------------------------------
-/// Emitted at the end of a successful `designate_beneficiary` call.
-pub const TOPIC_INHERITANCE_BENEFICIARY_SET: &str = "inherit_benef_set";
-/// Emitted at the end of a successful `remove_beneficiary` call.
-pub const TOPIC_INHERITANCE_BENEFICIARY_REMOVED: &str = "inherit_benef_rm";
-/// Emitted at the end of a successful `set_inactivity_timeout` call.
-pub const TOPIC_INHERITANCE_TIMEOUT_SET: &str = "inherit_timeout_set";
-/// Emitted at the end of a successful `claim_inheritance` call.
-pub const TOPIC_INHERITANCE_CLAIMED: &str = "inherit_claimed";
+// --- emergency pause (#428) -----------------------------------------------
+/// Emitted when the contract enters or exits emergency mode.
+pub const TOPIC_EMERGENCY_MODE_SET: &str = "emergency_mode_set";
+/// Emitted on a successful emergency withdrawal.
+pub const TOPIC_EMERGENCY_WITHDRAW: &str = "emergency_withdraw";
 
-// --- challenges (issue #442) -------------------------------------------
-/// Emitted at the end of a successful `create_challenge` call.
-pub const TOPIC_CHALLENGE_CREATED: &str = "challenge_created";
-/// Emitted at the end of a successful `join_challenge` call.
-pub const TOPIC_CHALLENGE_JOINED: &str = "challenge_joined";
-/// Emitted at the end of a successful `save_challenge` call.
-pub const TOPIC_CHALLENGE_SAVED: &str = "challenge_saved";
-/// Emitted at the end of a successful `claim_winner` call.
-pub const TOPIC_CHALLENGE_WON: &str = "challenge_won";
-/// Emitted at the end of a successful `refund_expired` call.
-pub const TOPIC_CHALLENGE_EXPIRED: &str = "challenge_expired";
+// --- contract upgrade (#429) ----------------------------------------------
+/// Emitted when an upgrade is proposed.
+pub const TOPIC_UPGRADE_PROPOSED: &str = "upgrade_proposed";
+/// Emitted when a pending upgrade is cancelled.
+pub const TOPIC_UPGRADE_CANCELLED: &str = "upgrade_cancelled";
 
+// --- insurance fund (#435) ------------------------------------------------
+/// Emitted when the insurance premium rate changes.
+pub const TOPIC_INSURANCE_PREMIUM_SET: &str = "insurance_premium_set";
+/// Emitted when funds are added to the insurance pool.
+pub const TOPIC_INSURANCE_FUNDED: &str = "insurance_funded";
+/// Emitted when an insurance claim is approved.
+pub const TOPIC_INSURANCE_CLAIM_APPROVED: &str = "insurance_claim_approved";
+/// Emitted when an insurance claim is redeemed.
+pub const TOPIC_INSURANCE_CLAIM_REDEEMED: &str = "insurance_claim_redeemed";

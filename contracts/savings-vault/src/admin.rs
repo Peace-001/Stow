@@ -3,9 +3,12 @@
 use soroban_sdk::{Address, BytesN, Env};
 
 use crate::error::Error;
-use crate::events::{EVENT_SCHEMA_VERSION, TOPIC_ADMIN_SET, TOPIC_INIT, TOPIC_UPGRADED};
+use crate::events::{
+    EVENT_SCHEMA_VERSION, TOPIC_ADMIN_SET, TOPIC_EMERGENCY_MODE_SET, TOPIC_INIT,
+    TOPIC_UPGRADE_CANCELLED, TOPIC_UPGRADE_PROPOSED, TOPIC_UPGRADED,
+};
 use crate::storage::{self, extend_instance_ttl};
-use crate::types::DataKey;
+use crate::types::{DataKey, UpgradeProposal};
 
 /// Initialize the vault.
 ///
@@ -28,6 +31,9 @@ pub fn initialize(env: &Env, admin: Address, token: Address) -> Result<(), Error
     env.storage().instance().set(&DataKey::NextGoalId, &0u64);
     env.storage().instance().set(&DataKey::NextGroupId, &0u64);
     env.storage().instance().set(&DataKey::Paused, &false);
+    env.storage().instance().set(&DataKey::EmergencyMode, &false);
+    env.storage().instance().set(&DataKey::Version, &1u32);
+    env.storage().instance().set(&DataKey::InsuranceFundBalance, &0i128);
 
     env.events().publish(
         (TOPIC_INIT,),
@@ -283,6 +289,197 @@ pub fn upgrade(env: &Env, caller: Address, new_wasm_hash: BytesN<32>) -> Result<
         (TOPIC_UPGRADED,),
         (caller, new_wasm_hash, env.ledger().timestamp()),
     );
+
+    Ok(())
+}
+
+// --- Emergency mode (#428) ------------------------------------------------
+
+/// Activate or deactivate emergency mode. Admin-only.
+///
+/// In emergency mode, only withdrawals are permitted — all deposits and
+/// other mutating operations are blocked. This provides a middle ground
+/// between full pause (nothing works) and normal operation, letting users
+/// retrieve their funds while preventing new inflows.
+pub fn set_emergency_mode(env: &Env, caller: Address, active: bool) -> Result<(), Error> {
+    extend_instance_ttl(env);
+
+    let current_admin = admin(env)?;
+    caller.require_auth();
+    if caller != current_admin {
+        return Err(Error::Unauthorized);
+    }
+
+    env.storage().instance().set(&DataKey::EmergencyMode, &active);
+
+    env.events().publish(
+        (TOPIC_EMERGENCY_MODE_SET,),
+        (caller, active, env.ledger().timestamp()),
+    );
+
+    Ok(())
+}
+
+/// Whether emergency mode is currently active. Defaults to `false`.
+pub fn is_emergency_mode(env: &Env) -> bool {
+    env.storage()
+        .instance()
+        .get(&DataKey::EmergencyMode)
+        .unwrap_or(false)
+}
+
+/// Guard for deposit entrypoints: rejects while in emergency mode.
+pub fn require_not_emergency(env: &Env) -> Result<(), Error> {
+    if is_emergency_mode(env) {
+        return Err(Error::EmergencyShutdown);
+    }
+    Ok(())
+}
+
+// --- Contract upgrade pattern (#429) --------------------------------------
+
+/// The current contract version. Starts at 1 after `initialize`.
+pub fn version(env: &Env) -> u32 {
+    env.storage().instance().get(&DataKey::Version).unwrap_or(1)
+}
+
+/// The configured upgrade delay in seconds. Defaults to 0 (no delay).
+pub fn upgrade_delay(env: &Env) -> u64 {
+    env.storage().instance().get(&DataKey::UpgradeDelay).unwrap_or(0)
+}
+
+/// Set the minimum delay before a proposed upgrade can be executed.
+/// Admin-only.
+pub fn set_upgrade_delay(env: &Env, caller: Address, seconds: u64) -> Result<(), Error> {
+    extend_instance_ttl(env);
+
+    let current_admin = admin(env)?;
+    caller.require_auth();
+    if caller != current_admin {
+        return Err(Error::Unauthorized);
+    }
+
+    env.storage().instance().set(&DataKey::UpgradeDelay, &seconds);
+
+    Ok(())
+}
+
+/// Propose an upgrade. Admin-only. The upgrade cannot execute until
+/// `upgrade_delay` seconds have elapsed.
+pub fn propose_upgrade(
+    env: &Env,
+    caller: Address,
+    new_wasm_hash: BytesN<32>,
+) -> Result<(), Error> {
+    extend_instance_ttl(env);
+
+    let current_admin = admin(env)?;
+    caller.require_auth();
+    if caller != current_admin {
+        return Err(Error::Unauthorized);
+    }
+
+    if env.storage().instance().has(&DataKey::PendingUpgrade) {
+        return Err(Error::ConflictingState);
+    }
+
+    let now = env.ledger().timestamp();
+    let delay = upgrade_delay(env);
+    let proposal = UpgradeProposal {
+        new_wasm_hash: new_wasm_hash.clone(),
+        proposed_by: caller.clone(),
+        proposed_at: now,
+        execute_after: now + delay,
+    };
+
+    env.storage().instance().set(&DataKey::PendingUpgrade, &proposal);
+
+    env.events().publish(
+        (TOPIC_UPGRADE_PROPOSED,),
+        (caller, new_wasm_hash, now, now + delay),
+    );
+
+    Ok(())
+}
+
+/// Execute a pending upgrade after its timelock has elapsed. Admin-only.
+pub fn execute_upgrade(env: &Env, caller: Address) -> Result<(), Error> {
+    extend_instance_ttl(env);
+
+    let current_admin = admin(env)?;
+    caller.require_auth();
+    if caller != current_admin {
+        return Err(Error::Unauthorized);
+    }
+
+    let proposal: UpgradeProposal = env
+        .storage()
+        .instance()
+        .get(&DataKey::PendingUpgrade)
+        .ok_or(Error::NotFound)?;
+
+    let now = env.ledger().timestamp();
+    if now < proposal.execute_after {
+        return Err(Error::TimeWindowNotOpen);
+    }
+
+    env.deployer()
+        .update_current_contract_wasm(proposal.new_wasm_hash.clone());
+
+    let ver = version(env) + 1;
+    env.storage().instance().set(&DataKey::Version, &ver);
+    env.storage().instance().remove(&DataKey::PendingUpgrade);
+
+    env.events().publish(
+        (TOPIC_UPGRADED,),
+        (caller, proposal.new_wasm_hash, now),
+    );
+
+    Ok(())
+}
+
+/// Cancel a pending upgrade. Admin-only.
+pub fn cancel_upgrade(env: &Env, caller: Address) -> Result<(), Error> {
+    extend_instance_ttl(env);
+
+    let current_admin = admin(env)?;
+    caller.require_auth();
+    if caller != current_admin {
+        return Err(Error::Unauthorized);
+    }
+
+    if !env.storage().instance().has(&DataKey::PendingUpgrade) {
+        return Err(Error::NotFound);
+    }
+
+    env.storage().instance().remove(&DataKey::PendingUpgrade);
+
+    env.events().publish(
+        (TOPIC_UPGRADE_CANCELLED,),
+        (caller, env.ledger().timestamp()),
+    );
+
+    Ok(())
+}
+
+/// Read the pending upgrade proposal, if any.
+pub fn pending_upgrade(env: &Env) -> Option<UpgradeProposal> {
+    env.storage().instance().get(&DataKey::PendingUpgrade)
+}
+
+/// Run post-upgrade state migration. Admin-only.
+///
+/// Called after an upgrade to migrate state to the new version's schema.
+/// This is a no-op placeholder: each future upgrade version adds its own
+/// migration logic here, guarded by `from_version`.
+pub fn migrate(env: &Env, caller: Address) -> Result<(), Error> {
+    extend_instance_ttl(env);
+
+    let current_admin = admin(env)?;
+    caller.require_auth();
+    if caller != current_admin {
+        return Err(Error::Unauthorized);
+    }
 
     Ok(())
 }

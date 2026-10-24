@@ -165,6 +165,27 @@ impl YieldAdapter {
         deposit::deposit(&env, from, amount)
     }
 
+    /// Batch deposit: deposit `amounts[i]` on behalf of `froms[i]` for each
+    /// item in a single atomic transaction. All items share a single
+    /// cross-contract `balance` read (for the cap check) and a single
+    /// `deposit` call to the strategy, cutting cross-contract invocations
+    /// from `2N` (N balance reads + N deposit calls) to `2` regardless of
+    /// batch size.
+    ///
+    /// Fails atomically: if any item is invalid or the strategy call fails,
+    /// no state is changed.
+    ///
+    /// - `froms.len()` must equal `amounts.len()`.
+    /// - Batch must be non-empty (`Error::EmptyBatch`).
+    /// - Batch must not exceed `MAX_BATCH_SIZE` items (`Error::BatchTooLarge`).
+    pub fn batch_deposit(
+        env: Env,
+        froms: Vec<Address>,
+        amounts: Vec<i128>,
+    ) -> Result<Vec<i128>, Error> {
+        deposit::batch_deposit(&env, froms, amounts)
+    }
+
     pub fn get_position(env: Env, owner: Address) -> Result<Position, Error> {
         deposit::get_position(&env, owner)
     }

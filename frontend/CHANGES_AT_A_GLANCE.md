@@ -6,7 +6,7 @@ Quick visual reference of responsive fixes applied to each page.
 
 ## �� Savings Goals Detail
 
-### Before → After
+### Before → After 
 
 #### Header
 ```tsx
@@ -16,7 +16,7 @@ Quick visual reference of responsive fixes applied to each page.
   <h1 className="text-3xl">{goal.name}</h1>
 </div>
 
-// ✅ After: Responsive & wraps
+// ✅ After: Responsive & wraps 
 <div className="flex flex-wrap items-center gap-2 sm:gap-3">
   <Target className="h-7 w-7 sm:h-8 sm:w-8 shrink-0" />
   <h1 className="text-2xl sm:text-3xl break-words">{goal.name}</h1>

@@ -60,4 +60,17 @@ pub enum Error {
     /// `harvest` was called before the minimum interval since the last
     /// harvest has elapsed.
     HarvestTooSoon = 50,
+
+    // --- cross-contract calls ---
+    /// A cross-contract call to the active strategy failed (the strategy
+    /// contract panicked or returned an error). Replaces the previous
+    /// behaviour of propagating an untyped host trap.
+    StrategyCallFailed = 60,
+
+    // --- batch ---
+    /// A batch operation was submitted with zero items.
+    EmptyBatch = 61,
+    /// A batch operation exceeded the maximum allowed number of items
+    /// (`MAX_BATCH_SIZE`).
+    BatchTooLarge = 62,
 }

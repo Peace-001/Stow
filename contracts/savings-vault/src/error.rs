@@ -159,6 +159,10 @@ pub enum Error {
     StorageLimitExceeded = 112,
     /// Invalid state transition.
     InvalidStateTransition = 113,
+    /// A goal cannot be claimed in the ledger where it was last funded.
+    SameLedger = 114,
+    /// A token callback attempted a nested token transfer.
+    ReentrantCall = 115,
 }
 
 impl Error {
@@ -247,6 +251,8 @@ impl Error {
             Error::DataCorruption => "Data corruption detected",
             Error::StorageLimitExceeded => "Storage limit exceeded",
             Error::InvalidStateTransition => "Invalid state transition",
+            Error::SameLedger => "Operation is not allowed in the funding ledger",
+            Error::ReentrantCall => "Reentrant token transfer rejected",
         }
     }
 
@@ -323,6 +329,8 @@ impl Error {
             | Error::DataCorruption 
             | Error::StorageLimitExceeded 
             | Error::InvalidStateTransition => "StorageAndState",
+
+            Error::SameLedger | Error::ReentrantCall => "Security",
         }
     }
 

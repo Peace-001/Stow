@@ -23,8 +23,8 @@ use crate::accounting::mul_div_floor;
 use crate::error::Error;
 use crate::events::{
     self, EVENT_SCHEMA_VERSION, TOPIC_ADMIN_SET, TOPIC_DEPOSITED, TOPIC_INIT, TOPIC_PAUSED_CHANGED,
-    TOPIC_STRATEGY_CHANGED, TOPIC_STRATEGY_DEREGISTERED, TOPIC_STRATEGY_REGISTERED, TOPIC_UPGRADED, TOPIC_WITHDRAW_CANCELLED,
-    TOPIC_WITHDRAW_CLAIMED, TOPIC_WITHDRAW_REQUESTED,
+    TOPIC_STRATEGY_CHANGED, TOPIC_STRATEGY_DEREGISTERED, TOPIC_STRATEGY_REGISTERED, TOPIC_UPGRADED,
+    TOPIC_WITHDRAW_CANCELLED, TOPIC_WITHDRAW_CLAIMED, TOPIC_WITHDRAW_REQUESTED,
 };
 use crate::fees::compute_performance_fee;
 use crate::types::{DataKey, StrategyInfo};
@@ -625,8 +625,14 @@ fn persistent_ttl(env: &Env, client: &YieldAdapterClient, key: &DataKey) -> u32 
 
 #[test]
 fn ttl_constants_leave_a_one_day_refresh_window() {
-    assert_eq!(INSTANCE_BUMP_AMOUNT - INSTANCE_LIFETIME_THRESHOLD, DAY_IN_LEDGERS);
-    assert_eq!(PERSISTENT_BUMP_AMOUNT - PERSISTENT_LIFETIME_THRESHOLD, DAY_IN_LEDGERS);
+    assert_eq!(
+        INSTANCE_BUMP_AMOUNT - INSTANCE_LIFETIME_THRESHOLD,
+        DAY_IN_LEDGERS
+    );
+    assert_eq!(
+        PERSISTENT_BUMP_AMOUNT - PERSISTENT_LIFETIME_THRESHOLD,
+        DAY_IN_LEDGERS
+    );
 }
 
 #[test]
@@ -672,18 +678,24 @@ fn extend_instance_ttl_refreshes_only_below_threshold() {
     let env = Env::default();
     let client = setup(&env);
 
-    env.as_contract(&client.address, || crate::storage::extend_instance_ttl(&env));
+    env.as_contract(&client.address, || {
+        crate::storage::extend_instance_ttl(&env)
+    });
     assert_eq!(instance_ttl(&env, &client), INSTANCE_BUMP_AMOUNT);
 
     // Still above the threshold: a second bump is a no-op.
     env.ledger().with_mut(|l| l.sequence_number += 10);
-    env.as_contract(&client.address, || crate::storage::extend_instance_ttl(&env));
+    env.as_contract(&client.address, || {
+        crate::storage::extend_instance_ttl(&env)
+    });
     assert_eq!(instance_ttl(&env, &client), INSTANCE_BUMP_AMOUNT - 10);
 
     // Decayed below the threshold: bumped back to the full amount.
     age_past_ttl_thresholds(&env);
     assert!(instance_ttl(&env, &client) < INSTANCE_LIFETIME_THRESHOLD);
-    env.as_contract(&client.address, || crate::storage::extend_instance_ttl(&env));
+    env.as_contract(&client.address, || {
+        crate::storage::extend_instance_ttl(&env)
+    });
     assert_eq!(instance_ttl(&env, &client), INSTANCE_BUMP_AMOUNT);
 }
 
@@ -1122,7 +1134,10 @@ fn deregister_active_strategy_is_rejected() {
         Err(Ok(Error::StrategyActive))
     );
     assert_eq!(client.get_strategy(&id).deregistered_at, None);
-    assert_eq!(adapter_events(&env, &client, TOPIC_STRATEGY_DEREGISTERED).len(), 0);
+    assert_eq!(
+        adapter_events(&env, &client, TOPIC_STRATEGY_DEREGISTERED).len(),
+        0
+    );
 }
 
 #[test]
@@ -1319,6 +1334,32 @@ fn deposit_forwards_to_active_strategy_with_exact_auth() {
 }
 
 #[test]
+fn deposit_gas_cost_stays_within_baseline() {
+    const CPU_BASELINE: u64 = 20_000_000;
+    const MEMORY_BASELINE: u64 = 4 * 1024 * 1024;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _treasury, token) = setup_with_token(&env);
+    let user = funded_user(&env, &token, 1_000);
+
+    let mut budget = env.budget();
+    budget.reset_default();
+    client.deposit(&user, &1_000);
+
+    let cpu_cost = budget.cpu_instruction_cost();
+    let memory_cost = budget.memory_bytes_cost();
+    assert!(
+        cpu_cost <= CPU_BASELINE,
+        "deposit CPU cost {cpu_cost} exceeds baseline {CPU_BASELINE}",
+    );
+    assert!(
+        memory_cost <= MEMORY_BASELINE,
+        "deposit memory cost {memory_cost} exceeds baseline {MEMORY_BASELINE}",
+    );
+}
+
+#[test]
 fn deposit_rejects_when_active_strategy_cap_exceeded() {
     let env = Env::default();
     env.mock_all_auths();
@@ -1486,6 +1527,46 @@ fn withdraw_round_trip_returns_correct_assets() {
         client.try_claim_withdraw(&user, &request_id),
         Err(Ok(Error::WithdrawAlreadyResolved))
     );
+}
+
+#[test]
+fn strategy_yield_withdrawal_keeps_balances_consistent() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    let (client, admin, _treasury, token) = setup_with_token(&env);
+    let strategy_address = setup_crate_mock_strategy(&env);
+    let strategy = crate::mock_strategy::MockStrategyClient::new(&env, &strategy_address);
+    strategy.init(&token);
+    let strategy_id = client.register_strategy(
+        &admin,
+        &strategy_address,
+        &String::from_str(&env, "token-backed"),
+    );
+    client.set_active_strategy(&admin, &strategy_id);
+    client.set_performance_fee_bps(&admin, &1_000);
+
+    let user = funded_user(&env, &token, 1_000);
+    assert_eq!(client.deposit(&user, &1_000), 1_000);
+    assert_eq!(balance_of(&env, &token, &strategy_address), 1_000);
+    assert_eq!(client.total_assets(), 1_000);
+    assert_eq!(client.total_shares(), 1_000);
+
+    strategy.simulate_yield(&client.address, &100);
+    mint(&env, &token, &strategy_address, 100);
+    assert_eq!(client.harvest(&Address::generate(&env)), 100);
+    assert_eq!(client.exchange_rate(), (1_090, 1_000));
+    assert_eq!(client.fees_accrued(), 10);
+
+    let request_id = client.request_withdraw(&user, &1_000);
+    assert_eq!(client.get_withdraw_request(&request_id).assets, 1_090);
+    assert_eq!(client.claim_withdraw(&user, &request_id), 1_090);
+
+    assert_eq!(balance_of(&env, &token, &user), 1_090);
+    assert_eq!(balance_of(&env, &token, &strategy_address), 10);
+    assert_eq!(strategy.balance(&client.address), 10);
+    assert_eq!(client.total_assets(), 0);
+    assert_eq!(client.total_shares(), 0);
+    assert_eq!(client.fees_accrued(), 10);
 }
 
 #[test]
@@ -1809,7 +1890,8 @@ fn require_not_paused_tracks_the_flag() {
     env.mock_all_auths();
     let (client, admin, _treasury, _token) = setup_with_token(&env);
 
-    let guard = |env: &Env| env.as_contract(&client.address, || crate::admin::require_not_paused(env));
+    let guard =
+        |env: &Env| env.as_contract(&client.address, || crate::admin::require_not_paused(env));
     assert!(!client.is_paused());
     assert_eq!(guard(&env), Ok(()));
 
@@ -2396,7 +2478,12 @@ fn redeemable(env: &Env, client: &YieldAdapterClient, shares: i128) -> i128 {
 /// following their doc comments: the payout is fixed with `convert_to_assets`
 /// *before* the shares are burned, then paid out of the adapter's idle
 /// balance. Swap this for the real entrypoints once they land.
-fn simulate_withdraw(env: &Env, client: &YieldAdapterClient, owner: &Address, shares: i128) -> i128 {
+fn simulate_withdraw(
+    env: &Env,
+    client: &YieldAdapterClient,
+    owner: &Address,
+    shares: i128,
+) -> i128 {
     use crate::types::{DataKey, Position};
 
     env.as_contract(&client.address, || {
@@ -2493,11 +2580,11 @@ fn share_rounding_never_allows_value_extraction() {
     let mut runner = TestRunner::new(Config::with_cases(PROPTEST_CASES));
     let ops = proptest::collection::vec(
         (
-            0u8..3,                     // op kind
-            0usize..3,                  // acting depositor
-            1i128..=1_000_000_000,      // amount (deposit / yield)
-            proptest::bool::ANY,        // shrink amount to 1..=16, to hit rounding edges
-            1i128..=10_000,             // withdraw fraction of position, in bps
+            0u8..3,                // op kind
+            0usize..3,             // acting depositor
+            1i128..=1_000_000_000, // amount (deposit / yield)
+            proptest::bool::ANY,   // shrink amount to 1..=16, to hit rounding edges
+            1i128..=10_000,        // withdraw fraction of position, in bps
         ),
         1..32,
     );
@@ -2719,6 +2806,35 @@ fn check_harvest_interval_rejects_too_soon() {
         assert_eq!(
             crate::harvest::check_harvest_interval(&env),
             Err(Error::HarvestTooSoon),
+        );
+    });
+}
+
+#[test]
+fn check_harvest_interval_handles_past_and_exact_boundary_timestamps() {
+    let env = Env::default();
+    let contract_id = env.register(YieldAdapter, ());
+    let last_harvest: u64 = 10_000;
+
+    env.as_contract(&contract_id, || {
+        env.storage()
+            .instance()
+            .set(&DataKey::HarvestInterval, &3_600u64);
+        env.storage()
+            .instance()
+            .set(&DataKey::LastHarvestAt, &last_harvest);
+
+        env.ledger().set_timestamp(last_harvest - 1);
+        assert_eq!(
+            crate::harvest::check_harvest_interval(&env),
+            Err(Error::HarvestTooSoon),
+            "a ledger timestamp before the previous harvest must not bypass the interval",
+        );
+
+        env.ledger().set_timestamp(last_harvest + 3_600);
+        assert!(
+            crate::harvest::check_harvest_interval(&env).is_ok(),
+            "harvest must be allowed at the exact interval boundary",
         );
     });
 }
@@ -4014,7 +4130,14 @@ fn exchange_rate_consistency_with_conversions() {
 
 /// Register + activate a mock strategy and set the performance fee.
 /// Returns `(client, admin, mock)`.
-fn setup_fee_harness(env: &Env, fee_bps: u32) -> (YieldAdapterClient, Address, crate::mock_strategy::MockStrategyClient) {
+fn setup_fee_harness(
+    env: &Env,
+    fee_bps: u32,
+) -> (
+    YieldAdapterClient,
+    Address,
+    crate::mock_strategy::MockStrategyClient,
+) {
     let (client, admin, _treasury, _token) = setup_with_token(env);
     let strategy_address = setup_crate_mock_strategy(env);
     let mock = crate::mock_strategy::MockStrategyClient::new(env, &strategy_address);
@@ -4206,4 +4329,440 @@ fn apply_performance_fee_returns_depositor_remainder() {
     assert_eq!(remainder, 850_000);
     assert_eq!(client.fees_accrued(), 150_000);
     assert_eq!(remainder + client.fees_accrued(), 1_000_000);
+}
+
+// ---------------------------------------------------------------------------
+// cross-contract call optimisation (#443)
+// ---------------------------------------------------------------------------
+//
+// Tests are grouped by the four requirements from the issue:
+//   A) Batch path gives the same result as N sequential single calls.
+//   B) Cross-contract invocation count of batch < N single calls.
+//   C) Empty / oversized batches are rejected.
+//   D) A failing item makes the whole batch fail atomically.
+//   E) Cross-contract failure returns the typed error and does not panic.
+
+// --- A: batch result equals N single calls ---------------------------------
+
+/// Two depositors processed through `batch_deposit` end up with exactly
+/// the shares they would have received from two sequential `deposit` calls.
+#[test]
+fn batch_deposit_matches_sequential_single_deposits() {
+    // --- reference: two sequential single deposits -------------------------
+    let env_ref = Env::default();
+    env_ref.mock_all_auths();
+    let (ref_client, _admin_r, _treasury_r, token_r) = setup_with_token(&env_ref);
+    let alice_r = funded_user(&env_ref, &token_r, 1_000);
+    let bob_r = funded_user(&env_ref, &token_r, 600);
+    let shares_alice_r = ref_client.deposit(&alice_r, &1_000);
+    let shares_bob_r = ref_client.deposit(&bob_r, &600);
+
+    // --- batch path --------------------------------------------------------
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _treasury, token) = setup_with_token(&env);
+    let alice = funded_user(&env, &token, 1_000);
+    let bob = funded_user(&env, &token, 600);
+
+    let froms = soroban_sdk::vec![&env, alice.clone(), bob.clone()];
+    let amounts = soroban_sdk::vec![&env, 1_000i128, 600i128];
+    let result = client.batch_deposit(&froms, &amounts);
+
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.get(0).unwrap(), shares_alice_r);
+    assert_eq!(result.get(1).unwrap(), shares_bob_r);
+
+    // Positions match the reference.
+    assert_eq!(client.get_position(&alice).shares, shares_alice_r);
+    assert_eq!(client.get_position(&bob).shares, shares_bob_r);
+    assert_eq!(client.total_shares(), shares_alice_r + shares_bob_r);
+    assert_eq!(balance_of(&env, &token, &alice), 0);
+    assert_eq!(balance_of(&env, &token, &bob), 0);
+}
+
+/// Batch deposits at a non-unit exchange rate produce the same shares as N
+/// sequential calls at the same rate.
+#[test]
+fn batch_deposit_shares_match_at_moved_exchange_rate() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _treasury, token) = setup_with_token(&env);
+
+    // Seed an exchange rate of 2 assets per share (1_000 shares, 2_000 assets).
+    let seed = funded_user(&env, &token, 1_000);
+    client.deposit(&seed, &1_000);
+    let donor = funded_user(&env, &token, 1_000);
+    soroban_sdk::token::Client::new(&env, &token).transfer(&donor, &client.address, &1_000);
+    assert_eq!(client.exchange_rate(), (2_000, 1_000));
+
+    // Sequential reference.
+    let alice = funded_user(&env, &token, 400);
+    let bob = funded_user(&env, &token, 600);
+    let env2 = Env::default();
+    env2.mock_all_auths();
+    let (c2, _, _, t2) = setup_with_token(&env2);
+    // Mirror the same 2:1 pool in env2.
+    let s2 = funded_user(&env2, &t2, 1_000);
+    c2.deposit(&s2, &1_000);
+    let d2 = funded_user(&env2, &t2, 1_000);
+    soroban_sdk::token::Client::new(&env2, &t2).transfer(&d2, &c2.address, &1_000);
+    let ref_alice = c2.deposit(&funded_user(&env2, &t2, 400), &400);
+    let ref_bob = c2.deposit(&funded_user(&env2, &t2, 600), &600);
+
+    // Batch in env.
+    let froms = soroban_sdk::vec![&env, alice.clone(), bob.clone()];
+    let amounts = soroban_sdk::vec![&env, 400i128, 600i128];
+    let batch_result = client.batch_deposit(&froms, &amounts);
+
+    assert_eq!(batch_result.get(0).unwrap(), ref_alice);
+    assert_eq!(batch_result.get(1).unwrap(), ref_bob);
+}
+
+// --- B: invocation-count reduction ----------------------------------------
+
+/// The mock strategy exposes `deposit_calls()` and `balance()`. With a cap
+/// configured, N single `deposit` calls make N `balance` reads + N `deposit`
+/// calls = 2N cross-contract invocations. The batch path makes at most
+/// 1 `balance` read + 1 `deposit` call = 2 invocations regardless of N.
+#[test]
+fn batch_deposit_uses_fewer_cross_contract_calls_than_sequential() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    let (client, admin, _treasury, token) = setup_with_token(&env);
+
+    // Use the richer crate-level MockStrategy which tracks call counts.
+    let strat_addr = setup_crate_mock_strategy(&env);
+    let strat = crate::mock_strategy::MockStrategyClient::new(&env, &strat_addr);
+    strat.init(&token);
+    let id = client.register_strategy(&admin, &strat_addr, &String::from_str(&env, "mock-counter"));
+    // Set a deposit cap so the single-deposit path reads balance on each call.
+    client.set_strategy_deposit_cap(&admin, &id, &1_000_000);
+    client.set_active_strategy(&admin, &id);
+
+    // --- N=3 sequential single deposits ------------------------------------
+    for _ in 0..3 {
+        let user = funded_user(&env, &token, 100);
+        client.deposit(&user, &100);
+    }
+    // Each single deposit with a cap triggers 1 balance read + 1 deposit
+    // call to the strategy. The mock only tracks deposit calls, so check
+    // that sequential deposits made exactly 3 strategy-deposit calls.
+    let single_deposit_calls = strat.deposit_calls();
+    assert_eq!(
+        single_deposit_calls, 3,
+        "3 sequential deposits must each call strategy.deposit once"
+    );
+
+    // --- reset and run the same 3 deposits as a single batch ---------------
+    // Pull the active strategy (strat) out via emergency_withdraw_all so we
+    // can re-activate a fresh counter-strategy without going through
+    // migrate_strategy (which would itself call deploy_to_strategy on strat2
+    // and inflate its deposit_calls counter before batch_deposit even runs).
+    client.emergency_withdraw_all(&admin);
+
+    let strat2_addr = setup_crate_mock_strategy(&env);
+    let strat2 = crate::mock_strategy::MockStrategyClient::new(&env, &strat2_addr);
+    strat2.init(&token);
+    let id2 = client.register_strategy(
+        &admin,
+        &strat2_addr,
+        &String::from_str(&env, "mock-counter2"),
+    );
+    client.set_strategy_deposit_cap(&admin, &id2, &1_000_000);
+    client.set_active_strategy(&admin, &id2);
+    // strat2.deposit_calls() is 0 here — no migration touched it.
+
+    let u1 = funded_user(&env, &token, 100);
+    let u2 = funded_user(&env, &token, 100);
+    let u3 = funded_user(&env, &token, 100);
+    client.batch_deposit(
+        &soroban_sdk::vec![&env, u1, u2, u3],
+        &soroban_sdk::vec![&env, 100i128, 100i128, 100i128],
+    );
+
+    // The batch must make exactly 1 strategy.deposit call (the combined amount).
+    let batch_deposit_calls = strat2.deposit_calls();
+    assert_eq!(
+        batch_deposit_calls, 1,
+        "batch_deposit must call strategy.deposit exactly once for the combined amount"
+    );
+
+    // Verify that 1 < 3 — the batch path issues fewer cross-contract calls.
+    assert!(
+        batch_deposit_calls < single_deposit_calls,
+        "batch ({}) must use fewer strategy calls than sequential ({})",
+        batch_deposit_calls,
+        single_deposit_calls
+    );
+}
+
+// --- C: empty and oversized batches are rejected ---------------------------
+
+#[test]
+fn batch_deposit_rejects_empty_batch() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _treasury, _token) = setup_with_token(&env);
+
+    let empty: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+    let empty_amounts: soroban_sdk::Vec<i128> = soroban_sdk::Vec::new(&env);
+    assert_eq!(
+        client.try_batch_deposit(&empty, &empty_amounts),
+        Err(Ok(Error::EmptyBatch))
+    );
+}
+
+#[test]
+fn batch_deposit_rejects_oversized_batch() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _treasury, token) = setup_with_token(&env);
+
+    let cap = crate::strategy::MAX_BATCH_SIZE as usize;
+    let mut froms: soroban_sdk::Vec<Address> = soroban_sdk::Vec::new(&env);
+    let mut amounts: soroban_sdk::Vec<i128> = soroban_sdk::Vec::new(&env);
+    // Build a batch one item over the limit.
+    for _ in 0..=cap {
+        froms.push_back(funded_user(&env, &token, 100));
+        amounts.push_back(100i128);
+    }
+    assert_eq!(
+        client.try_batch_deposit(&froms, &amounts),
+        Err(Ok(Error::BatchTooLarge))
+    );
+    // Exactly at the limit is accepted (no error).
+    let _ = froms.pop_back();
+    let _ = amounts.pop_back();
+    assert_eq!(froms.len(), cap as u32);
+    assert!(client.try_batch_deposit(&froms, &amounts).is_ok());
+}
+
+// --- D: atomic failure — a failing item rolls back the whole batch ---------
+
+/// If any amount in the batch is invalid (zero / negative), the entire call
+/// is rejected before any token transfer happens.
+#[test]
+fn batch_deposit_invalid_amount_rolls_back_all_items() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _treasury, token) = setup_with_token(&env);
+    let alice = funded_user(&env, &token, 500);
+    let bob = funded_user(&env, &token, 500);
+
+    // Second item has amount 0 — invalid.
+    let froms = soroban_sdk::vec![&env, alice.clone(), bob.clone()];
+    let amounts = soroban_sdk::vec![&env, 300i128, 0i128];
+    assert_eq!(
+        client.try_batch_deposit(&froms, &amounts),
+        Err(Ok(Error::InvalidAmount))
+    );
+
+    // Neither alice nor bob should have a position.
+    assert_eq!(client.try_get_position(&alice), Err(Ok(Error::NotFound)));
+    assert_eq!(client.try_get_position(&bob), Err(Ok(Error::NotFound)));
+    // Token balances are unchanged.
+    assert_eq!(balance_of(&env, &token, &alice), 500);
+    assert_eq!(balance_of(&env, &token, &bob), 500);
+}
+
+/// If the cap would be exceeded by the batch total, the entire call is
+/// rejected atomically — no partial state changes.
+#[test]
+fn batch_deposit_cap_exceeded_rolls_back_all_items() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _treasury, token) = setup_with_token(&env);
+    let (_, id) = activate_mock_strategy(&env, &client, &admin, &token);
+    client.set_strategy_deposit_cap(&admin, &id, &500);
+
+    let alice = funded_user(&env, &token, 300);
+    let bob = funded_user(&env, &token, 300);
+    // Combined 600 > cap 500.
+    let froms = soroban_sdk::vec![&env, alice.clone(), bob.clone()];
+    let amounts = soroban_sdk::vec![&env, 300i128, 300i128];
+    assert_eq!(
+        client.try_batch_deposit(&froms, &amounts),
+        Err(Ok(Error::StrategyCapExceeded))
+    );
+    assert_eq!(client.try_get_position(&alice), Err(Ok(Error::NotFound)));
+    assert_eq!(client.try_get_position(&bob), Err(Ok(Error::NotFound)));
+    assert_eq!(balance_of(&env, &token, &alice), 300);
+    assert_eq!(balance_of(&env, &token, &bob), 300);
+    assert_eq!(client.total_shares(), 0);
+}
+
+/// A strategy `deposit` failure during the execution pass causes the whole
+/// batch to be rolled back (no shares are minted, no tokens moved to
+/// the strategy).
+#[test]
+fn batch_deposit_strategy_call_failure_is_atomic() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    let (client, admin, _treasury, token) = setup_with_token(&env);
+
+    let strat_addr = setup_crate_mock_strategy(&env);
+    let strat = crate::mock_strategy::MockStrategyClient::new(&env, &strat_addr);
+    strat.init(&token);
+    let id = client.register_strategy(
+        &admin,
+        &strat_addr,
+        &String::from_str(&env, "failing-strat"),
+    );
+    client.set_active_strategy(&admin, &id);
+
+    // Make the strategy's deposit entrypoint fail.
+    strat.set_fail_deposit(&true);
+
+    let alice = funded_user(&env, &token, 200);
+    let bob = funded_user(&env, &token, 300);
+    let froms = soroban_sdk::vec![&env, alice.clone(), bob.clone()];
+    let amounts = soroban_sdk::vec![&env, 200i128, 300i128];
+
+    let result = client.try_batch_deposit(&froms, &amounts);
+    assert_eq!(result, Err(Ok(Error::StrategyCallFailed)));
+
+    // No positions or total_shares must have been written.
+    assert_eq!(client.try_get_position(&alice), Err(Ok(Error::NotFound)));
+    assert_eq!(client.try_get_position(&bob), Err(Ok(Error::NotFound)));
+    assert_eq!(client.total_shares(), 0);
+}
+
+// --- E: cross-contract failure returns typed error, does not panic ---------
+
+/// `strategy_balance` failure (e.g. strategy panics on `balance`) surfaces
+/// as `Error::StrategyCallFailed` rather than an untyped host trap.
+#[test]
+fn strategy_balance_failure_returns_typed_error_not_panic() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    let (client, admin, _treasury, token) = setup_with_token(&env);
+
+    let strat_addr = setup_crate_mock_strategy(&env);
+    let strat = crate::mock_strategy::MockStrategyClient::new(&env, &strat_addr);
+    strat.init(&token);
+    let id = client.register_strategy(&admin, &strat_addr, &String::from_str(&env, "fail-balance"));
+    // Set a cap so deposit actually calls strategy_balance for the check.
+    client.set_strategy_deposit_cap(&admin, &id, &1_000_000);
+    client.set_active_strategy(&admin, &id);
+
+    strat.set_fail_balance(&true);
+
+    let user = funded_user(&env, &token, 100);
+    let result = client.try_deposit(&user, &100);
+    assert_eq!(
+        result,
+        Err(Ok(Error::StrategyCallFailed)),
+        "a strategy balance failure must surface as StrategyCallFailed, not panic"
+    );
+    // Token must not have moved.
+    assert_eq!(balance_of(&env, &token, &user), 100);
+    assert_eq!(client.total_shares(), 0);
+}
+
+/// `deploy_to_strategy` failure surfaces as `Error::StrategyCallFailed`.
+#[test]
+fn strategy_deposit_failure_returns_typed_error_not_panic() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    let (client, admin, _treasury, token) = setup_with_token(&env);
+
+    let strat_addr = setup_crate_mock_strategy(&env);
+    let strat = crate::mock_strategy::MockStrategyClient::new(&env, &strat_addr);
+    strat.init(&token);
+    let id = client.register_strategy(&admin, &strat_addr, &String::from_str(&env, "fail-deposit"));
+    client.set_active_strategy(&admin, &id);
+
+    strat.set_fail_deposit(&true);
+
+    let user = funded_user(&env, &token, 100);
+    let result = client.try_deposit(&user, &100);
+    assert_eq!(
+        result,
+        Err(Ok(Error::StrategyCallFailed)),
+        "a strategy deposit failure must surface as StrategyCallFailed, not panic"
+    );
+}
+
+/// `withdraw_from_strategy` failure surfaces as `Error::StrategyCallFailed`.
+#[test]
+fn strategy_withdraw_failure_returns_typed_error_not_panic() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    let (client, admin, _treasury, token) = setup_with_token(&env);
+
+    let strat_addr = setup_crate_mock_strategy(&env);
+    let strat = crate::mock_strategy::MockStrategyClient::new(&env, &strat_addr);
+    strat.init(&token);
+    let id = client.register_strategy(
+        &admin,
+        &strat_addr,
+        &String::from_str(&env, "fail-withdraw"),
+    );
+    client.set_active_strategy(&admin, &id);
+
+    // Deposit first so there is something to withdraw.
+    let user = funded_user(&env, &token, 1_000);
+    client.deposit(&user, &1_000);
+
+    // Break the strategy's withdraw path.
+    strat.set_fail_withdraw(&true);
+
+    // claim_withdraw tries to pull a shortfall from the strategy.
+    let request_id = client.request_withdraw(&user, &1_000);
+    let result = client.try_claim_withdraw(&user, &request_id);
+    assert_eq!(
+        result,
+        Err(Ok(Error::StrategyCallFailed)),
+        "a strategy withdraw failure must surface as StrategyCallFailed, not panic"
+    );
+}
+
+/// `harvest` strategy `balance` failure surfaces as
+/// `Error::StrategyCallFailed`.
+#[test]
+fn harvest_strategy_balance_failure_returns_typed_error() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    let (client, admin, _treasury, _token) = setup_with_token(&env);
+
+    let strat_addr = setup_crate_mock_strategy(&env);
+    let strat = crate::mock_strategy::MockStrategyClient::new(&env, &strat_addr);
+    let id = client.register_strategy(&admin, &strat_addr, &String::from_str(&env, "fail-harvest"));
+    client.set_active_strategy(&admin, &id);
+
+    strat.set_fail_balance(&true);
+
+    let result = client.try_harvest(&Address::generate(&env));
+    assert_eq!(
+        result,
+        Err(Ok(Error::StrategyCallFailed)),
+        "a strategy balance failure during harvest must surface as StrategyCallFailed"
+    );
+}
+
+/// `emergency_withdraw_all` strategy `balance` failure surfaces as
+/// `Error::StrategyCallFailed`.
+#[test]
+fn emergency_withdraw_all_strategy_balance_failure_returns_typed_error() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    let (client, admin, _treasury, _token) = setup_with_token(&env);
+
+    let strat_addr = setup_crate_mock_strategy(&env);
+    let strat = crate::mock_strategy::MockStrategyClient::new(&env, &strat_addr);
+    let id = client.register_strategy(
+        &admin,
+        &strat_addr,
+        &String::from_str(&env, "fail-emergency"),
+    );
+    client.set_active_strategy(&admin, &id);
+
+    strat.set_fail_balance(&true);
+
+    let result = client.try_emergency_withdraw_all(&admin);
+    assert_eq!(
+        result,
+        Err(Ok(Error::StrategyCallFailed)),
+        "a strategy balance failure during emergency_withdraw_all must surface as StrategyCallFailed"
+    );
 }

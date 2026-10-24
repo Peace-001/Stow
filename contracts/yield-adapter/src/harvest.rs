@@ -7,6 +7,7 @@ use crate::admin;
 use crate::error::Error;
 use crate::events::TOPIC_HARVESTED;
 use crate::storage::extend_instance_ttl;
+use crate::strategy;
 use crate::types::{DataKey, StrategyInfo};
 
 /// Report the active strategy's current yield and update accounting.
@@ -47,12 +48,11 @@ pub fn harvest(env: &Env, caller: Address) -> Result<i128, Error> {
         .get(&DataKey::Strategy(active_id))
         .ok_or(Error::StrategyNotFound)?;
 
-    let contract_address = env.current_contract_address();
-    let live_balance: i128 = env.invoke_contract(
-        &info.address,
-        &soroban_sdk::Symbol::new(env, "balance"),
-        soroban_sdk::vec![env, soroban_sdk::IntoVal::into_val(&contract_address, env)],
-    );
+    // Reuse strategy::strategy_balance instead of a duplicate inline
+    // invoke_contract — this removes the redundant cross-contract read path
+    // and ensures the same try_invoke_contract / typed-error semantics as
+    // every other strategy call.
+    let live_balance: i128 = strategy::strategy_balance(env, &info.address)?;
 
     let tracked: i128 = env
         .storage()
