@@ -28,6 +28,7 @@ mod challenge;
 mod locked;
 pub mod rewards;
 mod storage;
+mod timelock;
 mod types;
 mod voting;
 
