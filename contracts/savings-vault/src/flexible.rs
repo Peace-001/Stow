@@ -5,6 +5,7 @@ use soroban_sdk::{Address, Env};
 use crate::admin;
 use crate::error::Error;
 use crate::events::{TOPIC_DEPOSIT, TOPIC_WITHDRAW};
+use crate::insurance;
 use crate::storage::{self, extend_instance_ttl};
 use crate::types::{DataKey, FlexibleAccount};
 
@@ -28,6 +29,8 @@ use crate::types::{DataKey, FlexibleAccount};
 /// `Overflow` if the resulting balance would not fit in `i128`.
 pub fn deposit(env: &Env, from: Address, amount: i128) -> Result<(), Error> {
     extend_instance_ttl(env);
+    admin::require_not_paused(env)?;
+    admin::require_not_emergency(env)?;
     from.require_auth();
 
     if amount <= 0 {
@@ -60,6 +63,9 @@ pub fn deposit(env: &Env, from: Address, amount: i128) -> Result<(), Error> {
     }
 
     storage::transfer_in(env, &from, amount)?;
+
+    let premium = insurance::collect_premium(env, amount)?;
+    let new_balance = new_balance.checked_sub(premium).ok_or(Error::Overflow)?;
 
     account.balance = new_balance;
     account.updated_at = now;

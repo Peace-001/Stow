@@ -1,4 +1,4 @@
-#![no_std]
+﻿#![no_std]
 //! # Stow Savings Vault
 //!
 //! Non-custodial savings on Soroban. Funds move only under contract rules.
@@ -22,7 +22,9 @@ mod flexible;
 mod goal;
 mod group;
 mod group_split;
+mod insurance;
 mod interest;
+mod challenge;
 mod locked;
 mod storage;
 mod timelock;
@@ -36,8 +38,8 @@ use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, Map, String};
 
 use crate::error::Error;
 use crate::types::{
-    CompoundFrequency, FlexibleAccount, Goal, Group, InterestAccount, LockedPlan, Proposal,
-    QueuedAction, TimelockAction,
+    CompoundFrequency, FlexibleAccount, Goal, Group, InsuranceClaimRecord, InterestAccount,
+    LockedPlan, Proposal, UpgradeProposal,
 };
 
 #[contract]
@@ -338,43 +340,117 @@ impl SavingsVault {
         interest::accrued(&env, owner)
     }
 
-    // --- timelock ----------------------------------------------------------
+    // --- emergency mode (#428) --------------------------------------------
 
-    /// Queue a critical admin action that will be executable after the
-    /// configured timelock delay has elapsed.
-    ///
-    /// Returns the unique action id. Admin-only.
-    pub fn queue_action(env: Env, action: TimelockAction) -> Result<u64, Error> {
-        timelock::queue_action(&env, action)
+    /// Activate or deactivate emergency mode. Admin-only.
+    /// In emergency mode only withdrawals are permitted.
+    pub fn set_emergency_mode(env: Env, caller: Address, active: bool) -> Result<(), Error> {
+        admin::set_emergency_mode(&env, caller, active)
     }
 
-    /// Execute a previously queued action whose ETA has been reached.
-    ///
-    /// Fails with `TimelockNotReady` before the ETA, `TimelockExpired` after
-    /// the grace period, `TimelockAlreadyExecuted` / `TimelockCancelled` for
-    /// non-Pending actions. Admin-only.
-    pub fn execute_action(env: Env, id: u64) -> Result<(), Error> {
-        timelock::execute_action(&env, id)
+    /// Whether the contract is in emergency mode.
+    pub fn is_emergency_mode(env: Env) -> bool {
+        admin::is_emergency_mode(&env)
     }
 
-    /// Cancel a queued action that has not yet been executed.
-    ///
-    /// Cancelled actions can never be executed. Admin-only.
-    pub fn cancel_action(env: Env, id: u64) -> Result<(), Error> {
-        timelock::cancel_action(&env, id)
+    /// Emergency withdrawal from a locked plan. Bypasses the timelock,
+    /// no penalty. Only available during emergency mode.
+    pub fn locked_emergency_withdraw(env: Env, owner: Address, plan_id: u64) -> Result<(), Error> {
+        locked::emergency_withdraw(&env, owner, plan_id)
     }
 
-    /// Read the state of a queued action by id.
-    pub fn get_queued_action(env: Env, id: u64) -> Result<QueuedAction, Error> {
-        timelock::get_queued_action(&env, id)
+    // --- contract upgrade pattern (#429) ----------------------------------
+
+    /// The current contract version number.
+    pub fn version(env: Env) -> u32 {
+        admin::version(&env)
     }
 
-    /// The currently configured timelock delay, in seconds.
-    ///
-    /// Defaults to [`timelock::DEFAULT_TIMELOCK_DELAY`] (24 h) until the
-    /// admin sets a different value via `queue_action` + `execute_action` with
-    /// `TimelockAction::SetTimelockDelay`.
-    pub fn timelock_delay(env: Env) -> u64 {
-        timelock::get_delay(&env)
+    /// The configured upgrade delay in seconds.
+    pub fn upgrade_delay(env: Env) -> u64 {
+        admin::upgrade_delay(&env)
+    }
+
+    /// Set the minimum delay before a proposed upgrade can execute.
+    pub fn set_upgrade_delay(env: Env, caller: Address, seconds: u64) -> Result<(), Error> {
+        admin::set_upgrade_delay(&env, caller, seconds)
+    }
+
+    /// Propose an upgrade with a timelock delay.
+    pub fn propose_upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        admin::propose_upgrade(&env, caller, new_wasm_hash)
+    }
+
+    /// Execute a pending upgrade after the timelock elapses.
+    pub fn execute_upgrade(env: Env, caller: Address) -> Result<(), Error> {
+        admin::execute_upgrade(&env, caller)
+    }
+
+    /// Cancel a pending upgrade.
+    pub fn cancel_upgrade(env: Env, caller: Address) -> Result<(), Error> {
+        admin::cancel_upgrade(&env, caller)
+    }
+
+    /// Read the pending upgrade proposal, if any.
+    pub fn pending_upgrade(env: Env) -> Option<UpgradeProposal> {
+        admin::pending_upgrade(&env)
+    }
+
+    /// Run post-upgrade state migration. Admin-only.
+    pub fn migrate(env: Env, caller: Address) -> Result<(), Error> {
+        admin::migrate(&env, caller)
+    }
+
+    // --- insurance fund (#435) --------------------------------------------
+
+    /// The insurance premium rate in basis points.
+    pub fn insurance_premium_bps(env: Env) -> u32 {
+        insurance::premium_bps(&env)
+    }
+
+    /// Set the insurance premium rate. Admin-only.
+    pub fn set_insurance_premium_bps(env: Env, caller: Address, bps: u32) -> Result<(), Error> {
+        insurance::set_premium_bps(&env, caller, bps)
+    }
+
+    /// The current insurance fund balance.
+    pub fn insurance_fund_balance(env: Env) -> i128 {
+        insurance::fund_balance(&env)
+    }
+
+    /// Add funds to the insurance pool. Admin-only.
+    pub fn insurance_fund(env: Env, caller: Address, amount: i128) -> Result<(), Error> {
+        insurance::fund(&env, caller, amount)
+    }
+
+    /// The maximum per-claim amount in basis points of fund balance.
+    pub fn insurance_max_claim_bps(env: Env) -> u32 {
+        insurance::max_claim_bps(&env)
+    }
+
+    /// Set the maximum per-claim basis points. Admin-only.
+    pub fn set_insurance_max_claim_bps(env: Env, caller: Address, bps: u32) -> Result<(), Error> {
+        insurance::set_max_claim_bps(&env, caller, bps)
+    }
+
+    /// Approve an insurance claim. Admin-only.
+    pub fn insurance_approve_claim(
+        env: Env,
+        caller: Address,
+        claimant: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        insurance::approve_claim(&env, caller, claimant, amount)
+    }
+
+    /// Redeem an approved insurance claim.
+    pub fn insurance_redeem_claim(env: Env, claimant: Address) -> Result<i128, Error> {
+        insurance::redeem_claim(&env, claimant)
+    }
+
+    /// Read an insurance claim record.
+    pub fn insurance_claim(env: Env, claimant: Address) -> Result<InsuranceClaimRecord, Error> {
+        insurance::get_claim(&env, claimant)
     }
 }
+
