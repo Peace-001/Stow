@@ -39,6 +39,7 @@ use crate::events::{
     TOPIC_INTEREST_CLAIMED, TOPIC_INTEREST_DEPOSIT, TOPIC_INTEREST_FREQUENCY_SET,
     TOPIC_INTEREST_RATE_SET, TOPIC_INTEREST_WITHDRAW,
 };
+use crate::rewards;
 use crate::storage::{self, extend_instance_ttl};
 use crate::types::{CompoundFrequency, DataKey, InterestAccount};
 
@@ -183,6 +184,9 @@ pub fn deposit(env: &Env, owner: Address, amount: i128) -> Result<(), Error> {
     env.storage().persistent().set(&key, &account);
     storage::extend_persistent_ttl(env, &key);
 
+    // Notify reward streak tracker that the user is active.
+    rewards::note_touch(env, &owner);
+
     env.events().publish(
         (TOPIC_INTEREST_DEPOSIT, owner.clone()),
         (owner, amount, account.principal, now),
@@ -236,6 +240,9 @@ pub fn withdraw(env: &Env, owner: Address, amount: i128) -> Result<(), Error> {
     account.updated_at = now;
     env.storage().persistent().set(&key, &account);
     storage::extend_persistent_ttl(env, &key);
+
+    // Notify reward streak tracker that the user is active.
+    rewards::note_touch(env, &owner);
 
     env.events().publish(
         (TOPIC_INTEREST_WITHDRAW, owner.clone()),

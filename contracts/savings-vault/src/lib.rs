@@ -27,6 +27,7 @@ mod insurance;
 mod interest;
 mod challenge;
 mod locked;
+pub mod rewards;
 mod storage;
 mod types;
 mod voting;

@@ -315,6 +315,7 @@ pub fn get_contributions(env: &Env, goal_id: u64) -> Result<Map<Address, i128>, 
 }
 
 /// Helper to allocate the next goal id.
+#[allow(dead_code)]
 fn next_goal_id(env: &Env) -> u64 {
     let key = DataKey::NextGoalId;
     let current: u64 = env.storage().instance().get(&key).unwrap_or(0);
