@@ -90,6 +90,10 @@ pub const TOPIC_GROUP_VOTE_CAST: &str = "group_vote_cast";
 /// outcome (`passed`) and the amount actually paid out (`spent`, 0 on a fail).
 pub const TOPIC_GROUP_PROPOSAL_EXECUTED: &str = "group_proposal_executed";
 
+// --- upgrade -----------------------------------------------------------
+/// Emitted at the end of a successful `upgrade` call.
+pub const TOPIC_UPGRADED: &str = "upgraded";
+
 // --- interest ----------------------------------------------------------
 /// Emitted at the end of a successful `set_interest_rate` call.
 pub const TOPIC_INTEREST_RATE_SET: &str = "interest_rate_set";

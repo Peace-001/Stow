@@ -64,7 +64,11 @@ pub fn top_up(env: &Env, owner: Address, plan_id: u64, amount: i128) -> Result<(
     }
 
     let key = DataKey::Locked(plan_id);
-    let mut plan: LockedPlan = env.storage().persistent().get(&key).ok_or(Error::NotFound)?;
+    let mut plan: LockedPlan = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(Error::NotFound)?;
     storage::extend_persistent_ttl(env, &key);
 
     if plan.owner != owner {
@@ -111,7 +115,11 @@ pub fn withdraw(env: &Env, owner: Address, plan_id: u64, amount: i128) -> Result
     }
 
     let key = DataKey::Locked(plan_id);
-    let mut plan: LockedPlan = env.storage().persistent().get(&key).ok_or(Error::NotFound)?;
+    let mut plan: LockedPlan = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(Error::NotFound)?;
     storage::extend_persistent_ttl(env, &key);
 
     if plan.owner != owner {
@@ -144,7 +152,11 @@ pub fn withdraw(env: &Env, owner: Address, plan_id: u64, amount: i128) -> Result
 
 pub fn get_plan(env: &Env, plan_id: u64) -> Result<LockedPlan, Error> {
     let key = DataKey::Locked(plan_id);
-    let plan = env.storage().persistent().get(&key).ok_or(Error::NotFound)?;
+    let plan = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(Error::NotFound)?;
     storage::extend_persistent_ttl(env, &key);
     Ok(plan)
 }
@@ -187,7 +199,11 @@ pub fn early_withdraw(env: &Env, owner: Address, plan_id: u64, amount: i128) -> 
     }
 
     let key = DataKey::Locked(plan_id);
-    let mut plan: LockedPlan = env.storage().persistent().get(&key).ok_or(Error::NotFound)?;
+    let mut plan: LockedPlan = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(Error::NotFound)?;
     storage::extend_persistent_ttl(env, &key);
 
     if plan.owner != owner {
@@ -215,10 +231,7 @@ pub fn early_withdraw(env: &Env, owner: Address, plan_id: u64, amount: i128) -> 
     }
 
     let bps = admin::early_withdraw_penalty_bps(env);
-    let penalty = amount
-        .checked_mul(bps as i128)
-        .ok_or(Error::Overflow)?
-        / 10_000;
+    let penalty = amount.checked_mul(bps as i128).ok_or(Error::Overflow)? / 10_000;
     let net = amount.checked_sub(penalty).ok_or(Error::Overflow)?;
 
     if net > 0 {
