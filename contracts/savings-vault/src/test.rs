@@ -12,7 +12,7 @@ use soroban_sdk::{
     contract, contractimpl,
     testutils::{Address as _, Events as _, Ledger, LedgerInfo},
     token::StellarAssetClient,
-    Address, Env, IntoVal, Map, String,
+    contract, contractimpl, Address, BytesN, Env, IntoVal, Map, String,
 };
 
 use crate::error::Error;
@@ -4266,719 +4266,364 @@ fn token_callback_cannot_reenter_vault_mutation() {
 }
 
 // ---------------------------------------------------------------------------
-// Issue #437 — Savings delegation
-//
-// An owner authorizes a delegate to manage savings on their behalf at a
-// given PermissionLevel (ViewOnly, Deposit, Full), optionally with an
-// expiry.  Tests cover: grant, each permission level (allowed/denied),
-// expiry, revoke, unauthorized caller, self-delegation, duplicate
-// delegation, update, and events.
+// Issue #428 — Emergency pause mechanism
 // ---------------------------------------------------------------------------
 
-/// Granting a delegation stores it with the right fields and no expiry.
 #[test]
-fn delegation_grant_stores_delegation() {
+fn emergency_mode_blocks_deposits_allows_withdrawals() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _admin, _token) = setup_with_token(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
 
-    let no_expiry: Option<u64> = None;
-    client.delegate_savings(&owner, &delegate, &PermissionLevel::Full, &no_expiry);
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
 
-    let d = client.get_delegation(&owner, &delegate);
-    assert_eq!(d.owner, owner);
-    assert_eq!(d.delegate, delegate);
-    assert_eq!(d.level, PermissionLevel::Full);
-    assert!(d.expires_at.is_none());
+    const DEPOSIT: i128 = 100_000_000;
+    mint(&env, &token, &token_admin, &user, DEPOSIT * 2);
+
+    client.deposit(&user, &DEPOSIT);
+    assert_eq!(client.get_account(&user).balance, DEPOSIT);
+    assert!(!client.is_emergency_mode());
+
+    client.set_emergency_mode(&admin, &true);
+    assert!(client.is_emergency_mode());
+
+    let deposit_result = client.try_deposit(&user, &DEPOSIT);
+    assert_eq!(deposit_result, Err(Ok(Error::EmergencyShutdown)));
+
+    client.withdraw(&user, &(DEPOSIT / 2));
+    assert_eq!(client.get_account(&user).balance, DEPOSIT / 2);
+
+    client.set_emergency_mode(&admin, &false);
+    assert!(!client.is_emergency_mode());
+
+    client.deposit(&user, &(DEPOSIT / 2));
 }
 
-/// Granting a delegation with an expiry stores the expiry timestamp.
 #[test]
-fn delegation_grant_with_expiry() {
+fn emergency_withdraw_from_locked_plan() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _admin, _token) = setup_with_token(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
 
-    let expiry = env.ledger().timestamp() + 10_000;
-    client.delegate_savings(&owner, &delegate, &PermissionLevel::Deposit, &Some(expiry));
-
-    let d = client.get_delegation(&owner, &delegate);
-    assert_eq!(d.level, PermissionLevel::Deposit);
-    assert_eq!(d.expires_at, Some(expiry));
-}
-
-/// An owner cannot delegate to their own address.
-#[test]
-fn delegation_self_delegation_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, _token) = setup_with_token(&env);
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
     let owner = Address::generate(&env);
 
-    let no_expiry: Option<u64> = None;
-    let result = client.try_delegate_savings(&owner, &owner, &PermissionLevel::Full, &no_expiry);
-    assert_eq!(result, Err(Ok(Error::InvalidAddress)));
+    const LOCKED_AMOUNT: i128 = 100_000_000;
+    mint(&env, &token, &token_admin, &owner, LOCKED_AMOUNT);
 
-    // No delegation should have been stored.
+    let now: u64 = 1_000_000;
+    set_ledger_time(&env, now, 100);
+    let plan_id = client.locked_create(&owner, &LOCKED_AMOUNT, &(now + 100_000));
+
+    // Without emergency mode, emergency withdraw fails.
+    let result = client.try_locked_emergency_withdraw(&owner, &plan_id);
+    assert_eq!(result, Err(Ok(Error::NotPaused)));
+
+    // Enable emergency mode.
+    client.set_emergency_mode(&admin, &true);
+
+    let token_client = soroban_sdk::token::Client::new(&env, &token);
+    let balance_before = token_client.balance(&owner);
+
+    client.locked_emergency_withdraw(&owner, &plan_id);
+
     assert_eq!(
-        client.try_get_delegation(&owner, &owner),
-        Err(Ok(Error::NotFound)),
+        token_client.balance(&owner) - balance_before,
+        LOCKED_AMOUNT,
     );
+    assert_eq!(client.locked_plan(&plan_id).balance, 0);
 }
 
-/// A duplicate delegation for the same (owner, delegate) pair is rejected.
 #[test]
-fn delegation_duplicate_rejected() {
+fn emergency_mode_non_admin_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let attacker = Address::generate(&env);
+
+    let result = client.try_set_emergency_mode(&attacker, &true);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    assert!(!client.is_emergency_mode());
+}
+
+// ---------------------------------------------------------------------------
+// Issue #429 — Contract upgrade pattern
+// ---------------------------------------------------------------------------
+
+#[test]
+fn version_starts_at_one() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, _admin, _token) = setup_with_token(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
+    assert_eq!(client.version(), 1);
+}
 
-    let no_expiry: Option<u64> = None;
-    client.delegate_savings(&owner, &delegate, &PermissionLevel::ViewOnly, &no_expiry);
+#[test]
+fn upgrade_delay_defaults_to_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _token) = setup_with_token(&env);
+    assert_eq!(client.upgrade_delay(), 0);
+}
 
-    let result = client.try_delegate_savings(&owner, &delegate, &PermissionLevel::Full, &no_expiry);
+#[test]
+fn propose_and_cancel_upgrade() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _token) = setup_with_token(&env);
+
+    let fake_hash = BytesN::from_array(&env, &[0u8; 32]);
+    client.propose_upgrade(&admin, &fake_hash);
+
+    let proposal = client.pending_upgrade();
+    assert!(proposal.is_some());
+    let proposal = proposal.unwrap();
+    assert_eq!(proposal.proposed_by, admin);
+
+    client.cancel_upgrade(&admin);
+    assert!(client.pending_upgrade().is_none());
+}
+
+#[test]
+fn propose_upgrade_rejects_duplicate() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _token) = setup_with_token(&env);
+
+    let fake_hash = BytesN::from_array(&env, &[0u8; 32]);
+    client.propose_upgrade(&admin, &fake_hash);
+
+    let result = client.try_propose_upgrade(&admin, &fake_hash);
     assert_eq!(result, Err(Ok(Error::ConflictingState)));
-
-    // The original delegation must be unchanged.
-    let d = client.get_delegation(&owner, &delegate);
-    assert_eq!(d.level, PermissionLevel::ViewOnly);
 }
 
-/// An expiry at or before the current timestamp is rejected.
 #[test]
-fn delegation_past_expiry_rejected() {
+fn upgrade_delay_enforced() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _admin, _token) = setup_with_token(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
 
-    let now = env.ledger().timestamp();
+    let (client, admin, _token) = setup_with_token(&env);
 
-    // Expiry equal to now is invalid.
-    let result = client.try_delegate_savings(&owner, &delegate, &PermissionLevel::Full, &Some(now));
-    assert_eq!(result, Err(Ok(Error::InvalidTimestamp)));
+    client.set_upgrade_delay(&admin, &3600);
+    assert_eq!(client.upgrade_delay(), 3600);
 
-    // Expiry before now is invalid (guard against now > 0).
-    if now > 0 {
-        let result =
-            client.try_delegate_savings(&owner, &delegate, &PermissionLevel::Full, &Some(now - 1));
-        assert_eq!(result, Err(Ok(Error::InvalidTimestamp)));
-    }
+    let now: u64 = 1_000_000;
+    set_ledger_time(&env, now, 100);
+
+    let fake_hash = BytesN::from_array(&env, &[0u8; 32]);
+    client.propose_upgrade(&admin, &fake_hash);
+
+    let result = client.try_execute_upgrade(&admin);
+    assert_eq!(result, Err(Ok(Error::TimeWindowNotOpen)));
+
+    set_ledger_time(&env, now + 3600, 200);
+    // execute_upgrade would call update_current_contract_wasm which panics
+    // in test env with an invalid hash, so we just verify the timelock
+    // passes by checking the proposal is still there
+    let proposal = client.pending_upgrade().unwrap();
+    assert_eq!(proposal.execute_after, now + 3600);
 }
 
-/// Only the owner can grant a delegation.
 #[test]
-fn delegation_grant_by_non_owner_rejected() {
+fn upgrade_non_admin_rejected() {
     let env = Env::default();
     env.mock_all_auths();
+
     let (client, _admin, _token) = setup_with_token(&env);
-    let owner = Address::generate(&env);
     let attacker = Address::generate(&env);
-    let delegate = Address::generate(&env);
 
-    let no_expiry: Option<u64> = None;
-    let result =
-        client.try_delegate_savings(&attacker, &delegate, &PermissionLevel::Full, &no_expiry);
+    let fake_hash = BytesN::from_array(&env, &[0u8; 32]);
+    let result = client.try_propose_upgrade(&attacker, &fake_hash);
     assert_eq!(result, Err(Ok(Error::Unauthorized)));
 }
 
-/// Only the owner can revoke a delegation.
 #[test]
-fn delegation_revoke_by_non_owner_rejected() {
+fn cancel_nonexistent_upgrade_rejected() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _admin, _token) = setup_with_token(&env);
-    let owner = Address::generate(&env);
+
+    let (client, admin, _token) = setup_with_token(&env);
+
+    let result = client.try_cancel_upgrade(&admin);
+    assert_eq!(result, Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn migrate_admin_only() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _token) = setup_with_token(&env);
     let attacker = Address::generate(&env);
-    let delegate = Address::generate(&env);
 
-    let no_expiry: Option<u64> = None;
-    client.delegate_savings(&owner, &delegate, &PermissionLevel::Full, &no_expiry);
+    client.migrate(&admin);
 
-    let result = client.try_revoke_delegation(&attacker, &delegate);
+    let result = client.try_migrate(&attacker);
     assert_eq!(result, Err(Ok(Error::Unauthorized)));
-
-    // Delegation must still exist.
-    let d = client.get_delegation(&owner, &delegate);
-    assert_eq!(d.level, PermissionLevel::Full);
 }
 
-/// Updating a delegation changes its level and expiry.
+// ---------------------------------------------------------------------------
+// Issue #435 — Savings insurance fund
+// ---------------------------------------------------------------------------
+
 #[test]
-fn delegation_update_changes_level_and_expiry() {
+fn insurance_premium_defaults_to_zero() {
     let env = Env::default();
     env.mock_all_auths();
     let (client, _admin, _token) = setup_with_token(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
-
-    let no_expiry: Option<u64> = None;
-    client.delegate_savings(&owner, &delegate, &PermissionLevel::ViewOnly, &no_expiry);
-
-    let new_expiry = env.ledger().timestamp() + 50_000;
-    client.update_delegation(&owner, &delegate, &PermissionLevel::Full, &Some(new_expiry));
-
-    let d = client.get_delegation(&owner, &delegate);
-    assert_eq!(d.level, PermissionLevel::Full);
-    assert_eq!(d.expires_at, Some(new_expiry));
-    // created_at must be unchanged; updated_at may have advanced.
-    let d0 = client.get_delegation(&owner, &delegate);
-    assert_eq!(d0.created_at, d.created_at);
+    assert_eq!(client.insurance_premium_bps(), 0);
+    assert_eq!(client.insurance_fund_balance(), 0);
 }
 
-/// Updating a non-existent delegation is rejected.
 #[test]
-fn delegation_update_nonexistent_rejected() {
+fn insurance_set_premium() {
     let env = Env::default();
     env.mock_all_auths();
+
+    let (client, admin, _token) = setup_with_token(&env);
+
+    client.set_insurance_premium_bps(&admin, &100);
+    assert_eq!(client.insurance_premium_bps(), 100);
+
+    let result = client.try_set_insurance_premium_bps(&admin, &10_001);
+    assert_eq!(result, Err(Ok(Error::InvalidParameters)));
+}
+
+#[test]
+fn insurance_set_premium_non_admin_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
     let (client, _admin, _token) = setup_with_token(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
+    let attacker = Address::generate(&env);
 
-    let no_expiry: Option<u64> = None;
-    let result =
-        client.try_update_delegation(&owner, &delegate, &PermissionLevel::Full, &no_expiry);
-    assert_eq!(result, Err(Ok(Error::NotFound)));
-}
-
-/// Revoking a delegation removes it so get_delegation returns NotFound.
-#[test]
-fn delegation_revoke_removes_delegation() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, _token) = setup_with_token(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
-
-    let no_expiry: Option<u64> = None;
-    client.delegate_savings(&owner, &delegate, &PermissionLevel::Full, &no_expiry);
-    client.revoke_delegation(&owner, &delegate);
-
-    assert_eq!(
-        client.try_get_delegation(&owner, &delegate),
-        Err(Ok(Error::NotFound)),
-    );
-}
-
-/// Revoking a non-existent delegation is rejected.
-#[test]
-fn delegation_revoke_nonexistent_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, _token) = setup_with_token(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
-
-    let result = client.try_revoke_delegation(&owner, &delegate);
-    assert_eq!(result, Err(Ok(Error::NotFound)));
-}
-
-/// A delegate with Deposit permission can deposit into the owner's account.
-#[test]
-fn delegated_deposit_with_deposit_permission_succeeds() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, token) = setup_with_token(&env);
-    let token_admin = Address::generate(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
-
-    const AMOUNT: i128 = 50_000_000;
-    mint(&env, &token, &token_admin, &delegate, AMOUNT);
-
-    let no_expiry: Option<u64> = None;
-    client.delegate_savings(&owner, &delegate, &PermissionLevel::Deposit, &no_expiry);
-
-    client.delegated_deposit(&delegate, &owner, &AMOUNT);
-
-    let account = client.get_account(&owner);
-    assert_eq!(account.balance, AMOUNT);
-    assert_eq!(account.owner, owner);
-}
-
-/// A delegate with Full permission can also deposit.
-#[test]
-fn delegated_deposit_with_full_permission_succeeds() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, token) = setup_with_token(&env);
-    let token_admin = Address::generate(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
-
-    const AMOUNT: i128 = 30_000_000;
-    mint(&env, &token, &token_admin, &delegate, AMOUNT);
-
-    let no_expiry: Option<u64> = None;
-    client.delegate_savings(&owner, &delegate, &PermissionLevel::Full, &no_expiry);
-
-    client.delegated_deposit(&delegate, &owner, &AMOUNT);
-    assert_eq!(client.get_account(&owner).balance, AMOUNT);
-}
-
-/// A delegate with ViewOnly permission cannot deposit.
-#[test]
-fn delegated_deposit_with_view_only_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, token) = setup_with_token(&env);
-    let token_admin = Address::generate(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
-
-    const AMOUNT: i128 = 50_000_000;
-    mint(&env, &token, &token_admin, &delegate, AMOUNT);
-
-    let no_expiry: Option<u64> = None;
-    client.delegate_savings(&owner, &delegate, &PermissionLevel::ViewOnly, &no_expiry);
-
-    let result = client.try_delegated_deposit(&delegate, &owner, &AMOUNT);
+    let result = client.try_set_insurance_premium_bps(&attacker, &100);
     assert_eq!(result, Err(Ok(Error::Unauthorized)));
-
-    // Owner's account must not have been created.
-    assert_eq!(client.try_get_account(&owner), Err(Ok(Error::NotFound)));
 }
 
-/// A delegate with no delegation at all cannot deposit.
 #[test]
-fn delegated_deposit_without_delegation_rejected() {
+fn insurance_fund_and_balance() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _admin, token) = setup_with_token(&env);
+
+    let (client, admin, token) = setup_with_token(&env);
     let token_admin = Address::generate(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
 
-    const AMOUNT: i128 = 50_000_000;
-    mint(&env, &token, &token_admin, &delegate, AMOUNT);
+    const FUND_AMOUNT: i128 = 50_000_000;
+    mint(&env, &token, &token_admin, &admin, FUND_AMOUNT);
 
-    let result = client.try_delegated_deposit(&delegate, &owner, &AMOUNT);
-    assert_eq!(result, Err(Ok(Error::NotFound)));
+    client.insurance_fund(&admin, &FUND_AMOUNT);
+    assert_eq!(client.insurance_fund_balance(), FUND_AMOUNT);
 }
 
-/// A delegate with Full permission can withdraw, and the funds go to the
-/// **owner's** wallet, never the delegate's.
 #[test]
-fn delegated_withdraw_with_full_permission_sends_to_owner() {
+fn insurance_approve_and_redeem_claim() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _admin, token) = setup_with_token(&env);
+
+    let (client, admin, token) = setup_with_token(&env);
     let token_admin = Address::generate(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
+    let claimant = Address::generate(&env);
 
-    const DEPOSIT: i128 = 100_000_000;
-    const WITHDRAW: i128 = 40_000_000;
+    const FUND_AMOUNT: i128 = 100_000_000;
+    const CLAIM_AMOUNT: i128 = 10_000_000;
+    mint(&env, &token, &token_admin, &admin, FUND_AMOUNT);
 
-    // Owner deposits their own funds first.
-    mint(&env, &token, &token_admin, &owner, DEPOSIT);
-    client.deposit(&owner, &DEPOSIT);
+    client.insurance_fund(&admin, &FUND_AMOUNT);
 
-    let no_expiry: Option<u64> = None;
-    client.delegate_savings(&owner, &delegate, &PermissionLevel::Full, &no_expiry);
+    client.insurance_approve_claim(&admin, &claimant, &CLAIM_AMOUNT);
+
+    let claim = client.insurance_claim(&claimant);
+    assert_eq!(claim.amount, CLAIM_AMOUNT);
+    assert!(!claim.redeemed);
 
     let token_client = soroban_sdk::token::Client::new(&env, &token);
-    let owner_before = token_client.balance(&owner);
-    let delegate_before = token_client.balance(&delegate);
+    let balance_before = token_client.balance(&claimant);
 
-    client.delegated_withdraw(&delegate, &owner, &WITHDRAW);
+    let redeemed = client.insurance_redeem_claim(&claimant);
+    assert_eq!(redeemed, CLAIM_AMOUNT);
 
-    // Funds must go to the owner, not the delegate.
     assert_eq!(
-        token_client.balance(&owner) - owner_before,
-        WITHDRAW,
-        "withdrawn funds must go to the owner",
+        token_client.balance(&claimant) - balance_before,
+        CLAIM_AMOUNT
     );
     assert_eq!(
-        token_client.balance(&delegate),
-        delegate_before,
-        "delegate must not receive withdrawn funds",
+        client.insurance_fund_balance(),
+        FUND_AMOUNT - CLAIM_AMOUNT
     );
-    assert_eq!(client.get_account(&owner).balance, DEPOSIT - WITHDRAW,);
+
+    let claim = client.insurance_claim(&claimant);
+    assert!(claim.redeemed);
 }
 
-/// A delegate with Deposit permission (not Full) cannot withdraw.
 #[test]
-fn delegated_withdraw_with_deposit_permission_rejected() {
+fn insurance_claim_exceeds_max_rejected() {
     let env = Env::default();
     env.mock_all_auths();
-    let (client, _admin, token) = setup_with_token(&env);
+
+    let (client, admin, token) = setup_with_token(&env);
     let token_admin = Address::generate(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
+    let claimant = Address::generate(&env);
+
+    const FUND_AMOUNT: i128 = 100_000_000;
+    mint(&env, &token, &token_admin, &admin, FUND_AMOUNT);
+
+    client.insurance_fund(&admin, &FUND_AMOUNT);
+    client.set_insurance_max_claim_bps(&admin, &500);
+
+    let max_allowed = FUND_AMOUNT * 500 / 10_000;
+    let result = client.try_insurance_approve_claim(&admin, &claimant, &(max_allowed + 1));
+    assert_eq!(result, Err(Ok(Error::DepositCapExceeded)));
+
+    client.insurance_approve_claim(&admin, &claimant, &max_allowed);
+}
+
+#[test]
+fn insurance_double_redeem_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let claimant = Address::generate(&env);
+
+    const FUND_AMOUNT: i128 = 100_000_000;
+    const CLAIM_AMOUNT: i128 = 5_000_000;
+    mint(&env, &token, &token_admin, &admin, FUND_AMOUNT);
+
+    client.insurance_fund(&admin, &FUND_AMOUNT);
+    client.insurance_approve_claim(&admin, &claimant, &CLAIM_AMOUNT);
+    client.insurance_redeem_claim(&claimant);
+
+    let result = client.try_insurance_redeem_claim(&claimant);
+    assert_eq!(result, Err(Ok(Error::ConflictingState)));
+}
+
+#[test]
+fn insurance_premium_collected_on_deposit() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
 
     const DEPOSIT: i128 = 100_000_000;
-    mint(&env, &token, &token_admin, &owner, DEPOSIT);
-    client.deposit(&owner, &DEPOSIT);
+    const PREMIUM_BPS: u32 = 100; // 1%
+    const EXPECTED_PREMIUM: i128 = DEPOSIT * PREMIUM_BPS as i128 / 10_000;
 
-    let no_expiry: Option<u64> = None;
-    client.delegate_savings(&owner, &delegate, &PermissionLevel::Deposit, &no_expiry);
+    client.set_insurance_premium_bps(&admin, &PREMIUM_BPS);
+    mint(&env, &token, &token_admin, &user, DEPOSIT);
 
-    let result = client.try_delegated_withdraw(&delegate, &owner, &40_000_000);
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
-    assert_eq!(client.get_account(&owner).balance, DEPOSIT);
-}
+    client.deposit(&user, &DEPOSIT);
 
-/// A delegate with ViewOnly permission cannot withdraw.
-#[test]
-fn delegated_withdraw_with_view_only_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, token) = setup_with_token(&env);
-    let token_admin = Address::generate(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
-
-    const DEPOSIT: i128 = 100_000_000;
-    mint(&env, &token, &token_admin, &owner, DEPOSIT);
-    client.deposit(&owner, &DEPOSIT);
-
-    let no_expiry: Option<u64> = None;
-    client.delegate_savings(&owner, &delegate, &PermissionLevel::ViewOnly, &no_expiry);
-
-    let result = client.try_delegated_withdraw(&delegate, &owner, &40_000_000);
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
-}
-
-/// An expired delegation cannot be used to deposit.
-#[test]
-fn delegated_deposit_after_expiry_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, token) = setup_with_token(&env);
-    let token_admin = Address::generate(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
-
-    const AMOUNT: i128 = 50_000_000;
-    mint(&env, &token, &token_admin, &delegate, AMOUNT);
-
-    let now = env.ledger().timestamp();
-    let expiry = now + 1_000;
-    client.delegate_savings(&owner, &delegate, &PermissionLevel::Deposit, &Some(expiry));
-
-    // Advance past the expiry.
-    set_ledger_time(&env, expiry, 2);
-
-    let result = client.try_delegated_deposit(&delegate, &owner, &AMOUNT);
-    assert_eq!(result, Err(Ok(Error::OperationExpired)));
-}
-
-/// An expired delegation cannot be used to withdraw.
-#[test]
-fn delegated_withdraw_after_expiry_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, token) = setup_with_token(&env);
-    let token_admin = Address::generate(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
-
-    const DEPOSIT: i128 = 100_000_000;
-    mint(&env, &token, &token_admin, &owner, DEPOSIT);
-    client.deposit(&owner, &DEPOSIT);
-
-    let now = env.ledger().timestamp();
-    let expiry = now + 1_000;
-    client.delegate_savings(&owner, &delegate, &PermissionLevel::Full, &Some(expiry));
-
-    // Advance past the expiry.
-    set_ledger_time(&env, expiry, 2);
-
-    let result = client.try_delegated_withdraw(&delegate, &owner, &40_000_000);
-    assert_eq!(result, Err(Ok(Error::OperationExpired)));
-    assert_eq!(client.get_account(&owner).balance, DEPOSIT);
-}
-
-/// A revoked delegation cannot be used to deposit.
-#[test]
-fn delegated_deposit_after_revoke_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, token) = setup_with_token(&env);
-    let token_admin = Address::generate(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
-
-    const AMOUNT: i128 = 50_000_000;
-    mint(&env, &token, &token_admin, &delegate, AMOUNT);
-
-    let no_expiry: Option<u64> = None;
-    client.delegate_savings(&owner, &delegate, &PermissionLevel::Deposit, &no_expiry);
-    client.revoke_delegation(&owner, &delegate);
-
-    let result = client.try_delegated_deposit(&delegate, &owner, &AMOUNT);
-    assert_eq!(result, Err(Ok(Error::NotFound)));
-}
-
-/// A revoked delegation cannot be used to withdraw.
-#[test]
-fn delegated_withdraw_after_revoke_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, token) = setup_with_token(&env);
-    let token_admin = Address::generate(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
-
-    const DEPOSIT: i128 = 100_000_000;
-    mint(&env, &token, &token_admin, &owner, DEPOSIT);
-    client.deposit(&owner, &DEPOSIT);
-
-    let no_expiry: Option<u64> = None;
-    client.delegate_savings(&owner, &delegate, &PermissionLevel::Full, &no_expiry);
-    client.revoke_delegation(&owner, &delegate);
-
-    let result = client.try_delegated_withdraw(&delegate, &owner, &40_000_000);
-    assert_eq!(result, Err(Ok(Error::NotFound)));
-    assert_eq!(client.get_account(&owner).balance, DEPOSIT);
-}
-
-/// `delegate_savings` emits a `delegation_granted` event with topics
-/// `(delegation_granted, owner, delegate)` and data `(owner, delegate,
-/// level, expires_at, timestamp)`.
-#[test]
-fn delegation_grant_emits_typed_event() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, _token) = setup_with_token(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
-
-    let no_expiry: Option<u64> = None;
-    let now = env.ledger().timestamp();
-    client.delegate_savings(&owner, &delegate, &PermissionLevel::Full, &no_expiry);
-
-    let events = env.events().all();
-    let (contract_id, topics, data) = events.last().unwrap().clone();
-
-    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> = (
-        crate::events::TOPIC_DELEGATION_GRANTED,
-        owner.clone(),
-        delegate.clone(),
-    )
-        .into_val(&env);
-    let decoded_data: (Address, Address, PermissionLevel, u64, u64) =
-        soroban_sdk::TryFromVal::try_from_val(&env, &data).unwrap();
-
-    assert_eq!(contract_id, client.address);
-    assert_eq!(topics, expected_topics);
+    assert_eq!(client.insurance_fund_balance(), EXPECTED_PREMIUM);
     assert_eq!(
-        decoded_data,
-        (owner, delegate, PermissionLevel::Full, 0, now)
+        client.get_account(&user).balance,
+        DEPOSIT - EXPECTED_PREMIUM,
     );
-}
-
-/// `update_delegation` emits a `delegation_updated` event with topics
-/// `(delegation_updated, owner, delegate)` and data `(owner, delegate,
-/// level, expires_at, timestamp)`.
-#[test]
-fn delegation_update_emits_typed_event() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, _token) = setup_with_token(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
-
-    let no_expiry: Option<u64> = None;
-    client.delegate_savings(&owner, &delegate, &PermissionLevel::ViewOnly, &no_expiry);
-
-    let new_expiry = env.ledger().timestamp() + 50_000;
-    let now = env.ledger().timestamp();
-    client.update_delegation(&owner, &delegate, &PermissionLevel::Full, &Some(new_expiry));
-
-    let events = env.events().all();
-    let (contract_id, topics, data) = events.last().unwrap().clone();
-
-    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> = (
-        crate::events::TOPIC_DELEGATION_UPDATED,
-        owner.clone(),
-        delegate.clone(),
-    )
-        .into_val(&env);
-    let decoded_data: (Address, Address, PermissionLevel, u64, u64) =
-        soroban_sdk::TryFromVal::try_from_val(&env, &data).unwrap();
-
-    assert_eq!(contract_id, client.address);
-    assert_eq!(topics, expected_topics);
-    assert_eq!(
-        decoded_data,
-        (owner, delegate, PermissionLevel::Full, new_expiry, now)
-    );
-}
-
-/// `revoke_delegation` emits a `delegation_revoked` event with topics
-/// `(delegation_revoked, owner, delegate)` and data `(owner, delegate,
-/// timestamp)`.
-#[test]
-fn delegation_revoke_emits_typed_event() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, _token) = setup_with_token(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
-
-    let no_expiry: Option<u64> = None;
-    client.delegate_savings(&owner, &delegate, &PermissionLevel::Full, &no_expiry);
-
-    let now = env.ledger().timestamp();
-    client.revoke_delegation(&owner, &delegate);
-
-    let events = env.events().all();
-    let (contract_id, topics, data) = events.last().unwrap().clone();
-
-    let expected_topics: soroban_sdk::Vec<soroban_sdk::Val> = (
-        crate::events::TOPIC_DELEGATION_REVOKED,
-        owner.clone(),
-        delegate.clone(),
-    )
-        .into_val(&env);
-    let decoded_data: (Address, Address, u64) =
-        soroban_sdk::TryFromVal::try_from_val(&env, &data).unwrap();
-
-    assert_eq!(contract_id, client.address);
-    assert_eq!(topics, expected_topics);
-    assert_eq!(decoded_data, (owner, delegate, now));
-}
-
-/// `delegate_savings` must require the owner's authorization — a call
-/// without auth must fail.
-#[test]
-fn delegate_savings_without_owner_auth_rejected() {
-    let env = Env::default();
-    let (client, _admin, _token) = setup_with_token(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
-
-    let no_expiry: Option<u64> = None;
-    let result = client.try_delegate_savings(&owner, &delegate, &PermissionLevel::Full, &no_expiry);
-    assert!(
-        result.is_err(),
-        "delegate_savings must fail without owner's authorization"
-    );
-}
-
-/// `revoke_delegation` must require the owner's authorization.
-#[test]
-fn revoke_delegation_without_owner_auth_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, _token) = setup_with_token(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
-
-    let no_expiry: Option<u64> = None;
-    client.delegate_savings(&owner, &delegate, &PermissionLevel::Full, &no_expiry);
-
-    // Disable auth mocking.
-    env.set_auths(&[]);
-
-    let result = client.try_revoke_delegation(&owner, &delegate);
-    assert!(
-        result.is_err(),
-        "revoke_delegation must fail without owner's authorization"
-    );
-}
-
-/// `delegated_deposit` must require the delegate's authorization.
-#[test]
-fn delegated_deposit_without_delegate_auth_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, token) = setup_with_token(&env);
-    let token_admin = Address::generate(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
-
-    const AMOUNT: i128 = 50_000_000;
-    mint(&env, &token, &token_admin, &delegate, AMOUNT);
-
-    let no_expiry: Option<u64> = None;
-    client.delegate_savings(&owner, &delegate, &PermissionLevel::Deposit, &no_expiry);
-
-    env.set_auths(&[]);
-
-    let result = client.try_delegated_deposit(&delegate, &owner, &AMOUNT);
-    assert!(
-        result.is_err(),
-        "delegated_deposit must fail without delegate's authorization"
-    );
-}
-
-/// `delegated_withdraw` must require the delegate's authorization.
-#[test]
-fn delegated_withdraw_without_delegate_auth_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, token) = setup_with_token(&env);
-    let token_admin = Address::generate(&env);
-    let owner = Address::generate(&env);
-    let delegate = Address::generate(&env);
-
-    const DEPOSIT: i128 = 100_000_000;
-    mint(&env, &token, &token_admin, &owner, DEPOSIT);
-    client.deposit(&owner, &DEPOSIT);
-
-    let no_expiry: Option<u64> = None;
-    client.delegate_savings(&owner, &delegate, &PermissionLevel::Full, &no_expiry);
-
-    env.set_auths(&[]);
-
-    let result = client.try_delegated_withdraw(&delegate, &owner, &40_000_000);
-    assert!(
-        result.is_err(),
-        "delegated_withdraw must fail without delegate's authorization"
-    );
-}
-
-/// An owner can have multiple delegates, each with a different permission
-/// level, and they are independent.
-#[test]
-fn delegation_multiple_delegates_independent() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let (client, _admin, token) = setup_with_token(&env);
-    let token_admin = Address::generate(&env);
-    let owner = Address::generate(&env);
-    let viewer = Address::generate(&env);
-    let depositor = Address::generate(&env);
-    let manager = Address::generate(&env);
-
-    let no_expiry: Option<u64> = None;
-    client.delegate_savings(&owner, &viewer, &PermissionLevel::ViewOnly, &no_expiry);
-    client.delegate_savings(&owner, &depositor, &PermissionLevel::Deposit, &no_expiry);
-    client.delegate_savings(&owner, &manager, &PermissionLevel::Full, &no_expiry);
-
-    // Viewer cannot deposit.
-    let result = client.try_delegated_deposit(&viewer, &owner, &1_000_000);
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
-
-    // Depositor can deposit but not withdraw.
-    const AMOUNT: i128 = 30_000_000;
-    mint(&env, &token, &token_admin, &depositor, AMOUNT);
-    client.delegated_deposit(&depositor, &owner, &AMOUNT);
-    let result = client.try_delegated_withdraw(&depositor, &owner, &10_000_000);
-    assert_eq!(result, Err(Ok(Error::Unauthorized)));
-
-    // Manager can withdraw.
-    let token_client = soroban_sdk::token::Client::new(&env, &token);
-    let owner_before = token_client.balance(&owner);
-    client.delegated_withdraw(&manager, &owner, &10_000_000);
-    assert_eq!(token_client.balance(&owner) - owner_before, 10_000_000);
-
-    // Revoking the depositor does not affect the manager.
-    client.revoke_delegation(&owner, &depositor);
-    assert_eq!(
-        client.try_get_delegation(&owner, &depositor),
-        Err(Ok(Error::NotFound)),
-    );
-    let d = client.get_delegation(&owner, &manager);
-    assert_eq!(d.level, PermissionLevel::Full);
 }

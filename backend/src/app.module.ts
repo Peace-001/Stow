@@ -34,6 +34,7 @@ import { AnchorModule } from './anchor/anchor.module';
 import { CsvImportModule } from './csv-import/csv-import.module';
 import { GraphqlApiModule } from './graphql/graphql.module';
 import { CacheModule } from './cache/cache.module';
+import { MetricsModule } from './metrics/metrics.module';
 
 @Module({
   imports: [
@@ -100,6 +101,7 @@ import { CacheModule } from './cache/cache.module';
     }),
 
     CacheModule,
+    MetricsModule,
     HealthModule,
     AuthModule,
     UsersModule,

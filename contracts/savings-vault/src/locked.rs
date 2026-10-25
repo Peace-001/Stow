@@ -5,7 +5,8 @@ use soroban_sdk::{Address, Env};
 use crate::admin;
 use crate::error::Error;
 use crate::events::{
-    TOPIC_LOCKED_CREATED, TOPIC_LOCKED_EARLY_WITHDRAW, TOPIC_LOCKED_TOP_UP, TOPIC_LOCKED_WITHDRAW,
+    TOPIC_EMERGENCY_WITHDRAW, TOPIC_LOCKED_CREATED, TOPIC_LOCKED_EARLY_WITHDRAW,
+    TOPIC_LOCKED_TOP_UP, TOPIC_LOCKED_WITHDRAW,
 };
 use crate::storage::{self, extend_instance_ttl};
 use crate::types::{DataKey, LockedPlan};
@@ -248,6 +249,48 @@ pub fn early_withdraw(env: &Env, owner: Address, plan_id: u64, amount: i128) -> 
     env.events().publish(
         (TOPIC_LOCKED_EARLY_WITHDRAW, owner.clone(), plan_id),
         (plan_id, owner, amount, penalty, new_balance, now),
+    );
+
+    Ok(())
+}
+
+/// Emergency withdrawal from a locked plan. Only available when the contract
+/// is in emergency mode. Bypasses the timelock and incurs no penalty.
+pub fn emergency_withdraw(
+    env: &Env,
+    owner: Address,
+    plan_id: u64,
+) -> Result<(), Error> {
+    extend_instance_ttl(env);
+    owner.require_auth();
+
+    if !admin::is_emergency_mode(env) {
+        return Err(Error::NotPaused);
+    }
+
+    let key = DataKey::Locked(plan_id);
+    let mut plan: LockedPlan = env.storage().persistent().get(&key).ok_or(Error::NotFound)?;
+    storage::extend_persistent_ttl(env, &key);
+
+    if plan.owner != owner {
+        return Err(Error::Unauthorized);
+    }
+
+    if plan.balance <= 0 {
+        return Err(Error::InsufficientBalance);
+    }
+
+    let amount = plan.balance;
+    storage::transfer_out(env, &owner, amount)?;
+
+    plan.balance = 0;
+    env.storage().persistent().set(&key, &plan);
+    storage::extend_persistent_ttl(env, &key);
+
+    let now = env.ledger().timestamp();
+    env.events().publish(
+        (TOPIC_EMERGENCY_WITHDRAW, owner.clone(), plan_id),
+        (plan_id, owner, amount, now),
     );
 
     Ok(())

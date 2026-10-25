@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Map, String, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Map, String, Vec};
 
 /// A flexible savings account: deposit and withdraw any time.
 #[contracttype]
@@ -161,44 +161,24 @@ pub struct InterestAccount {
     pub updated_at: u64,
 }
 
-/// Permission level granted to a delegate for savings management.
-///
-/// Variants are ordered by capability: `ViewOnly < Deposit < Full`, so a
-/// derived `Ord` comparison ("does this level include that level?") matches
-/// the intuitive hierarchy. See [`crate::delegation`].
-#[contracttype]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-pub enum PermissionLevel {
-    /// Read-only access to the owner's savings accounts.
-    ViewOnly,
-    /// Can deposit into the owner's flexible account on the owner's behalf.
-    /// Withdrawals are not permitted.
-    Deposit,
-    /// Full management: deposit and withdraw. Withdrawals are always sent to
-    /// the **owner's** wallet, never the delegate's.
-    Full,
-}
-
-/// A savings delegation: an owner authorizes a delegate to manage savings on
-/// their behalf at a given [`PermissionLevel`], optionally expiring at a
-/// ledger timestamp.
-///
-/// See [`crate::delegation`] for the full lifecycle (grant, update, revoke,
-/// and delegated deposit/withdraw).
+/// A pending upgrade proposal with a timelock delay.
 #[contracttype]
 #[derive(Clone)]
-pub struct Delegation {
-    /// The savings owner who granted this delegation.
-    pub owner: Address,
-    /// The authorized delegate address.
-    pub delegate: Address,
-    /// What the delegate is allowed to do.
-    pub level: PermissionLevel,
-    /// Ledger timestamp after which the delegation is no longer valid.
-    /// `None` means the delegation never expires on its own.
-    pub expires_at: Option<u64>,
-    pub created_at: u64,
-    pub updated_at: u64,
+pub struct UpgradeProposal {
+    pub new_wasm_hash: BytesN<32>,
+    pub proposed_by: Address,
+    pub proposed_at: u64,
+    pub execute_after: u64,
+}
+
+/// An approved insurance claim that a user can redeem.
+#[contracttype]
+#[derive(Clone)]
+pub struct InsuranceClaimRecord {
+    pub claimant: Address,
+    pub amount: i128,
+    pub approved_at: u64,
+    pub redeemed: bool,
 }
 
 /// Storage keys. One variant per logical record family.
@@ -341,10 +321,27 @@ pub enum DataKey {
     GoalLastContributionLedger(u64),
     /// Set while an external token transfer is in progress.
     TokenTransferActive,
-    /// `Delegation` by (owner, delegate) pair.
-    ///
-    /// Durability: persistent — one entry per (owner, delegate) pair, an
-    /// unbounded key space. TTL: bumped on every read/write via
-    /// [`extend_persistent_ttl`], the same pattern as `InterestAccount`.
-    Delegation(Address, Address),
+
+    // --- Emergency pause (#428) ---
+    /// Emergency mode flag. When active, only withdrawals are permitted.
+    EmergencyMode,
+
+    // --- Contract upgrade pattern (#429) ---
+    /// Current contract version number.
+    Version,
+    /// Pending upgrade proposal: stores `UpgradeProposal`.
+    PendingUpgrade,
+    /// Minimum delay (in seconds) before a proposed upgrade can execute.
+    UpgradeDelay,
+
+    // --- Insurance fund (#435) ---
+    /// Insurance fund pool balance.
+    InsuranceFundBalance,
+    /// Insurance premium rate in basis points, collected on deposits.
+    InsurancePremiumBps,
+    /// Maximum claimable amount per user from the insurance fund.
+    InsuranceMaxClaimBps,
+    /// Approved insurance claim by user address.
+    InsuranceClaim(Address),
 }
+
