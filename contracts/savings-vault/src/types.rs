@@ -1,4 +1,4 @@
-use soroban_sdk::{contracttype, Address, Map, String, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Map, String, Vec};
 
 // ---------------------------------------------------------------------------
 // Rewards (new for #440)
@@ -220,6 +220,26 @@ pub struct InterestAccount {
     pub updated_at: u64,
 }
 
+/// A pending upgrade proposal with a timelock delay.
+#[contracttype]
+#[derive(Clone)]
+pub struct UpgradeProposal {
+    pub new_wasm_hash: BytesN<32>,
+    pub proposed_by: Address,
+    pub proposed_at: u64,
+    pub execute_after: u64,
+}
+
+/// An approved insurance claim that a user can redeem.
+#[contracttype]
+#[derive(Clone)]
+pub struct InsuranceClaimRecord {
+    pub claimant: Address,
+    pub amount: i128,
+    pub approved_at: u64,
+    pub redeemed: bool,
+}
+
 /// Storage keys. One variant per logical record family.
 ///
 /// See `storage` module docs for the full storage model: durability
@@ -361,17 +381,26 @@ pub enum DataKey {
     /// Set while an external token transfer is in progress (reentrancy guard).
     TokenTransferActive,
 
-    // --- Rewards (new for #440) ---
-    /// Admin-configured rewards parameters.
-    ///
-    /// Durability: instance — single config record, read on every accrual.
-    RewardsConfig,
-    /// Total token stroops currently available in the reward pool.
-    ///
-    /// Durability: instance — single counter, updated on every fund/claim.
-    RewardPoolBalance,
-    /// Per-user reward tracking (`RewardState` by owner).
-    ///
-    /// Durability: persistent — one entry per user.
-    RewardState(Address),
+    // --- Emergency pause (#428) ---
+    /// Emergency mode flag. When active, only withdrawals are permitted.
+    EmergencyMode,
+
+    // --- Contract upgrade pattern (#429) ---
+    /// Current contract version number.
+    Version,
+    /// Pending upgrade proposal: stores `UpgradeProposal`.
+    PendingUpgrade,
+    /// Minimum delay (in seconds) before a proposed upgrade can execute.
+    UpgradeDelay,
+
+    // --- Insurance fund (#435) ---
+    /// Insurance fund pool balance.
+    InsuranceFundBalance,
+    /// Insurance premium rate in basis points, collected on deposits.
+    InsurancePremiumBps,
+    /// Maximum claimable amount per user from the insurance fund.
+    InsuranceMaxClaimBps,
+    /// Approved insurance claim by user address.
+    InsuranceClaim(Address),
 }
+

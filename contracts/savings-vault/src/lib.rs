@@ -1,4 +1,4 @@
-#![no_std]
+﻿#![no_std]
 //! # Stow Savings Vault
 //!
 //! Non-custodial savings on Soroban. Funds move only under contract rules.
@@ -22,7 +22,9 @@ mod flexible;
 mod goal;
 mod group;
 mod group_split;
+mod insurance;
 mod interest;
+mod challenge;
 mod locked;
 pub mod rewards;
 mod storage;
@@ -36,8 +38,8 @@ use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, Map, String};
 
 use crate::error::Error;
 use crate::types::{
-    CompoundFrequency, FlexibleAccount, Goal, Group, InterestAccount, LockedPlan, Proposal,
-    RewardState, RewardsConfig,
+    CompoundFrequency, FlexibleAccount, Goal, Group, InsuranceClaimRecord, InterestAccount,
+    LockedPlan, Proposal, UpgradeProposal,
 };
 
 #[contract]
@@ -373,61 +375,117 @@ impl SavingsVault {
         interest::accrued(&env, owner)
     }
 
-    // --- rewards -----------------------------------------------------------
+    // --- emergency mode (#428) --------------------------------------------
 
-    /// Admin-only: configure the rewards system.
-    ///
-    /// Validates: `base_rate_bps ≤ 10_000`, both period values non-zero,
-    /// `loyalty_cap_bps ≥ 10_000`, tiers sorted ascending, ≤ 4 tiers.
-    pub fn reward_set_config(
+    /// Activate or deactivate emergency mode. Admin-only.
+    /// In emergency mode only withdrawals are permitted.
+    pub fn set_emergency_mode(env: Env, caller: Address, active: bool) -> Result<(), Error> {
+        admin::set_emergency_mode(&env, caller, active)
+    }
+
+    /// Whether the contract is in emergency mode.
+    pub fn is_emergency_mode(env: Env) -> bool {
+        admin::is_emergency_mode(&env)
+    }
+
+    /// Emergency withdrawal from a locked plan. Bypasses the timelock,
+    /// no penalty. Only available during emergency mode.
+    pub fn locked_emergency_withdraw(env: Env, owner: Address, plan_id: u64) -> Result<(), Error> {
+        locked::emergency_withdraw(&env, owner, plan_id)
+    }
+
+    // --- contract upgrade pattern (#429) ----------------------------------
+
+    /// The current contract version number.
+    pub fn version(env: Env) -> u32 {
+        admin::version(&env)
+    }
+
+    /// The configured upgrade delay in seconds.
+    pub fn upgrade_delay(env: Env) -> u64 {
+        admin::upgrade_delay(&env)
+    }
+
+    /// Set the minimum delay before a proposed upgrade can execute.
+    pub fn set_upgrade_delay(env: Env, caller: Address, seconds: u64) -> Result<(), Error> {
+        admin::set_upgrade_delay(&env, caller, seconds)
+    }
+
+    /// Propose an upgrade with a timelock delay.
+    pub fn propose_upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        admin::propose_upgrade(&env, caller, new_wasm_hash)
+    }
+
+    /// Execute a pending upgrade after the timelock elapses.
+    pub fn execute_upgrade(env: Env, caller: Address) -> Result<(), Error> {
+        admin::execute_upgrade(&env, caller)
+    }
+
+    /// Cancel a pending upgrade.
+    pub fn cancel_upgrade(env: Env, caller: Address) -> Result<(), Error> {
+        admin::cancel_upgrade(&env, caller)
+    }
+
+    /// Read the pending upgrade proposal, if any.
+    pub fn pending_upgrade(env: Env) -> Option<UpgradeProposal> {
+        admin::pending_upgrade(&env)
+    }
+
+    /// Run post-upgrade state migration. Admin-only.
+    pub fn migrate(env: Env, caller: Address) -> Result<(), Error> {
+        admin::migrate(&env, caller)
+    }
+
+    // --- insurance fund (#435) --------------------------------------------
+
+    /// The insurance premium rate in basis points.
+    pub fn insurance_premium_bps(env: Env) -> u32 {
+        insurance::premium_bps(&env)
+    }
+
+    /// Set the insurance premium rate. Admin-only.
+    pub fn set_insurance_premium_bps(env: Env, caller: Address, bps: u32) -> Result<(), Error> {
+        insurance::set_premium_bps(&env, caller, bps)
+    }
+
+    /// The current insurance fund balance.
+    pub fn insurance_fund_balance(env: Env) -> i128 {
+        insurance::fund_balance(&env)
+    }
+
+    /// Add funds to the insurance pool. Admin-only.
+    pub fn insurance_fund(env: Env, caller: Address, amount: i128) -> Result<(), Error> {
+        insurance::fund(&env, caller, amount)
+    }
+
+    /// The maximum per-claim amount in basis points of fund balance.
+    pub fn insurance_max_claim_bps(env: Env) -> u32 {
+        insurance::max_claim_bps(&env)
+    }
+
+    /// Set the maximum per-claim basis points. Admin-only.
+    pub fn set_insurance_max_claim_bps(env: Env, caller: Address, bps: u32) -> Result<(), Error> {
+        insurance::set_max_claim_bps(&env, caller, bps)
+    }
+
+    /// Approve an insurance claim. Admin-only.
+    pub fn insurance_approve_claim(
         env: Env,
         caller: Address,
-        config: RewardsConfig,
+        claimant: Address,
+        amount: i128,
     ) -> Result<(), Error> {
-        rewards::set_config(&env, caller, config)
+        insurance::approve_claim(&env, caller, claimant, amount)
     }
 
-    /// Read the current rewards configuration.
-    pub fn reward_config(env: Env) -> RewardsConfig {
-        rewards::get_config(&env)
+    /// Redeem an approved insurance claim.
+    pub fn insurance_redeem_claim(env: Env, claimant: Address) -> Result<i128, Error> {
+        insurance::redeem_claim(&env, claimant)
     }
 
-    /// Admin-only: transfer `amount` tokens from `caller` into the reward pool.
-    pub fn reward_fund(env: Env, caller: Address, amount: i128) -> Result<(), Error> {
-        rewards::fund_pool(&env, caller, amount)
-    }
-
-    /// Current balance of the reward pool, in token stroops.
-    pub fn reward_pool_balance(env: Env) -> i128 {
-        rewards::pool_balance(&env)
-    }
-
-    /// Settle all elapsed accrual periods into the caller's pending balance.
-    /// Permissionless — anyone may trigger accrual for any user.
-    /// Returns the amount newly accrued.
-    pub fn reward_accrue(env: Env, owner: Address) -> Result<i128, Error> {
-        rewards::accrue(&env, owner)
-    }
-
-    /// Claim pending rewards. Settles first, then pays `min(pending, pool)`
-    /// to `owner`. Returns the amount paid out. Requires `owner.require_auth`.
-    pub fn reward_claim(env: Env, owner: Address) -> Result<i128, Error> {
-        rewards::claim(&env, owner)
-    }
-
-    /// Mark the caller active in the current streak period without accruing.
-    /// Requires an existing interest account.
-    pub fn reward_ping(env: Env, owner: Address) -> Result<(), Error> {
-        rewards::ping(&env, owner)
-    }
-
-    /// Read the reward state for `owner`. Returns `None` if never initialised.
-    pub fn reward_state(env: Env, owner: Address) -> Option<RewardState> {
-        rewards::get_reward_state(&env, owner)
-    }
-
-    /// Preview how much would be accrued right now (read-only, no storage writes).
-    pub fn reward_accrued_preview(env: Env, owner: Address) -> Result<i128, Error> {
-        rewards::accrued_preview(&env, owner)
+    /// Read an insurance claim record.
+    pub fn insurance_claim(env: Env, claimant: Address) -> Result<InsuranceClaimRecord, Error> {
+        insurance::get_claim(&env, claimant)
     }
 }
+
