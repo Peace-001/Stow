@@ -26,6 +26,7 @@ mod insurance;
 mod interest;
 mod challenge;
 mod locked;
+pub mod rewards;
 mod storage;
 mod timelock;
 mod types;
@@ -148,15 +149,30 @@ impl SavingsVault {
     }
 
     // --- locked ------------------------------------------------------------
-    pub fn locked_create(env: Env, owner: Address, amount: i128, unlock_at: u64) -> Result<u64, Error> {
+    pub fn locked_create(
+        env: Env,
+        owner: Address,
+        amount: i128,
+        unlock_at: u64,
+    ) -> Result<u64, Error> {
         locked::create(&env, owner, amount, unlock_at)
     }
 
-    pub fn locked_top_up(env: Env, owner: Address, plan_id: u64, amount: i128) -> Result<(), Error> {
+    pub fn locked_top_up(
+        env: Env,
+        owner: Address,
+        plan_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
         locked::top_up(&env, owner, plan_id, amount)
     }
 
-    pub fn locked_withdraw(env: Env, owner: Address, plan_id: u64, amount: i128) -> Result<(), Error> {
+    pub fn locked_withdraw(
+        env: Env,
+        owner: Address,
+        plan_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
         locked::withdraw(&env, owner, plan_id, amount)
     }
 
@@ -176,11 +192,21 @@ impl SavingsVault {
     }
 
     // --- goal --------------------------------------------------------------
-    pub fn goal_create(env: Env, owner: Address, name: String, target_amount: i128) -> Result<u64, Error> {
+    pub fn goal_create(
+        env: Env,
+        owner: Address,
+        name: String,
+        target_amount: i128,
+    ) -> Result<u64, Error> {
         goal::create(&env, owner, name, target_amount)
     }
 
-    pub fn goal_contribute(env: Env, from: Address, goal_id: u64, amount: i128) -> Result<(), Error> {
+    pub fn goal_contribute(
+        env: Env,
+        from: Address,
+        goal_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
         goal::contribute(&env, from, goal_id, amount)
     }
 
@@ -216,7 +242,12 @@ impl SavingsVault {
         group::join(&env, member, group_id)
     }
 
-    pub fn group_contribute(env: Env, member: Address, group_id: u64, amount: i128) -> Result<(), Error> {
+    pub fn group_contribute(
+        env: Env,
+        member: Address,
+        group_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
         group::contribute(&env, member, group_id, amount)
     }
 
@@ -233,7 +264,12 @@ impl SavingsVault {
     }
 
     // --- group split -------------------------------------------------------
-    pub fn group_set_shares(env: Env, creator: Address, group_id: u64, shares_bps: Map<Address, u32>) -> Result<(), Error> {
+    pub fn group_set_shares(
+        env: Env,
+        creator: Address,
+        group_id: u64,
+        shares_bps: Map<Address, u32>,
+    ) -> Result<(), Error> {
         group_split::set_shares(&env, creator, group_id, shares_bps)
     }
 
