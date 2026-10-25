@@ -18,7 +18,7 @@ use soroban_sdk::{
 use crate::error::Error;
 use crate::events::{TOPIC_DEPOSIT, TOPIC_WITHDRAW};
 use crate::group_split;
-use crate::types::CompoundFrequency;
+use crate::types::{CompoundFrequency, PermissionLevel};
 use crate::{SavingsVault, SavingsVaultClient};
 
 #[contract]
@@ -1249,7 +1249,7 @@ fn event_goal_reached_is_size_optimized() {
     mint(&env, &token, &token_admin, &owner, TARGET);
 
     let goal_id = client.goal_create(&owner, &String::from_str(&env, "milestone"), &TARGET);
-    
+
     // Contribute exactly to target to trigger goal_reached event.
     client.goal_contribute(&owner, &goal_id, &TARGET);
 
@@ -1360,7 +1360,11 @@ fn event_interest_claimed_is_gas_efficient() {
         claimed_event.topics.len() >= 2,
         "interest_claimed must have indexed user address"
     );
-}lan's balance — isolates the time-lock guard from the balance guard
+}
+
+/// Locked plan withdrawal before the unlock time must be rejected with
+/// `Error::StillLocked`, even when the requested amount is well within the
+/// plan's balance — isolates the time-lock guard from the balance guard
 /// (paired with `locked_withdraw_over_balance_rejected` above, which
 /// isolates the balance guard from the time-lock guard).
 #[test]

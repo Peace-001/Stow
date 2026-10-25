@@ -16,6 +16,7 @@
 //! and a `TODO(issue)` describing the work. Each stub is one contributor issue.
 
 mod admin;
+mod delegation;
 mod error;
 mod events;
 mod flexible;
