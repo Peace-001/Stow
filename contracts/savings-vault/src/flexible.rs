@@ -5,6 +5,7 @@ use soroban_sdk::{Address, Env};
 use crate::admin;
 use crate::error::Error;
 use crate::events::{TOPIC_DEPOSIT, TOPIC_WITHDRAW};
+use crate::insurance;
 use crate::storage::{self, extend_instance_ttl};
 use crate::types::{DataKey, FlexibleAccount};
 
@@ -28,6 +29,8 @@ use crate::types::{DataKey, FlexibleAccount};
 /// `Overflow` if the resulting balance would not fit in `i128`.
 pub fn deposit(env: &Env, from: Address, amount: i128) -> Result<(), Error> {
     extend_instance_ttl(env);
+    admin::require_not_paused(env)?;
+    admin::require_not_emergency(env)?;
     from.require_auth();
 
     if amount <= 0 {
@@ -61,13 +64,18 @@ pub fn deposit(env: &Env, from: Address, amount: i128) -> Result<(), Error> {
 
     storage::transfer_in(env, &from, amount)?;
 
+    let premium = insurance::collect_premium(env, amount)?;
+    let new_balance = new_balance.checked_sub(premium).ok_or(Error::Overflow)?;
+
     account.balance = new_balance;
     account.updated_at = now;
     env.storage().persistent().set(&key, &account);
     storage::extend_persistent_ttl(env, &key);
 
-    env.events()
-        .publish((TOPIC_DEPOSIT, from.clone()), (from, amount, new_balance, now));
+    env.events().publish(
+        (TOPIC_DEPOSIT, from.clone()),
+        (from, amount, new_balance, now),
+    );
 
     Ok(())
 }
@@ -96,8 +104,11 @@ pub fn withdraw(env: &Env, owner: Address, amount: i128) -> Result<(), Error> {
     }
 
     let key = DataKey::Flexible(owner.clone());
-    let mut account: FlexibleAccount =
-        env.storage().persistent().get(&key).ok_or(Error::NotFound)?;
+    let mut account: FlexibleAccount = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(Error::NotFound)?;
     storage::extend_persistent_ttl(env, &key);
 
     if amount > account.balance {
@@ -125,7 +136,11 @@ pub fn withdraw(env: &Env, owner: Address, amount: i128) -> Result<(), Error> {
 /// Read the caller's flexible account (or `NotFound`).
 pub fn get_account(env: &Env, owner: Address) -> Result<FlexibleAccount, Error> {
     let key = DataKey::Flexible(owner);
-    let account = env.storage().persistent().get(&key).ok_or(Error::NotFound)?;
+    let account = env
+        .storage()
+        .persistent()
+        .get(&key)
+        .ok_or(Error::NotFound)?;
     storage::extend_persistent_ttl(env, &key);
     Ok(account)
 }

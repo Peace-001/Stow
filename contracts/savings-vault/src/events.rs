@@ -21,6 +21,8 @@ pub const EVENT_SCHEMA_VERSION: u32 = 1;
 pub const TOPIC_INIT: &str = "init";
 /// Emitted at the end of a successful `set_admin` call.
 pub const TOPIC_ADMIN_SET: &str = "admin_set";
+/// Emitted at the end of a successful `upgrade` call.
+pub const TOPIC_UPGRADED: &str = "upgraded";
 
 // --- flexible ------------------------------------------------------------
 /// Emitted at the end of a successful `deposit` call.
@@ -90,6 +92,10 @@ pub const TOPIC_GROUP_VOTE_CAST: &str = "group_vote_cast";
 /// outcome (`passed`) and the amount actually paid out (`spent`, 0 on a fail).
 pub const TOPIC_GROUP_PROPOSAL_EXECUTED: &str = "group_proposal_executed";
 
+// --- upgrade -----------------------------------------------------------
+/// Emitted at the end of a successful `upgrade` call.
+pub const TOPIC_UPGRADED: &str = "upgraded";
+
 // --- interest ----------------------------------------------------------
 /// Emitted at the end of a successful `set_interest_rate` call.
 pub const TOPIC_INTEREST_RATE_SET: &str = "interest_rate_set";
@@ -103,13 +109,24 @@ pub const TOPIC_INTEREST_WITHDRAW: &str = "interest_withdraw";
 /// interest credited to principal.
 pub const TOPIC_INTEREST_CLAIMED: &str = "interest_claimed";
 
-// --- fees (issue #430) -------------------------------------------------
-pub const TOPIC_FEE_BPS_SET: &str = "fee_bps_set";
-pub const TOPIC_FEE_RECIPIENT_SET: &str = "fee_recipient_set";
+// --- emergency pause (#428) -----------------------------------------------
+/// Emitted when the contract enters or exits emergency mode.
+pub const TOPIC_EMERGENCY_MODE_SET: &str = "emergency_mode_set";
+/// Emitted on a successful emergency withdrawal.
+pub const TOPIC_EMERGENCY_WITHDRAW: &str = "emergency_withdraw";
 
-// --- multi-token (issue #436) -------------------------------------------
-pub const TOPIC_TOKEN_ADDED: &str = "token_added";
-pub const TOPIC_TOKEN_REMOVED: &str = "token_removed";
-pub const TOPIC_CONVERSION_RATE_SET: &str = "conversion_rate_set";
-pub const TOPIC_BALANCE_CONVERTED: &str = "balance_converted";
+// --- contract upgrade (#429) ----------------------------------------------
+/// Emitted when an upgrade is proposed.
+pub const TOPIC_UPGRADE_PROPOSED: &str = "upgrade_proposed";
+/// Emitted when a pending upgrade is cancelled.
+pub const TOPIC_UPGRADE_CANCELLED: &str = "upgrade_cancelled";
 
+// --- insurance fund (#435) ------------------------------------------------
+/// Emitted when the insurance premium rate changes.
+pub const TOPIC_INSURANCE_PREMIUM_SET: &str = "insurance_premium_set";
+/// Emitted when funds are added to the insurance pool.
+pub const TOPIC_INSURANCE_FUNDED: &str = "insurance_funded";
+/// Emitted when an insurance claim is approved.
+pub const TOPIC_INSURANCE_CLAIM_APPROVED: &str = "insurance_claim_approved";
+/// Emitted when an insurance claim is redeemed.
+pub const TOPIC_INSURANCE_CLAIM_REDEEMED: &str = "insurance_claim_redeemed";

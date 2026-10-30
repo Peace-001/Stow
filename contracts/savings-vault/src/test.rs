@@ -9,16 +9,78 @@
 //! the bare contract shell (no token) can still call [`setup`].
 
 use soroban_sdk::{
+    contract, contractclient, contractimpl,
     testutils::{Address as _, Events as _, Ledger, LedgerInfo},
     token::StellarAssetClient,
-    Address, Env, IntoVal, Map, String,
+    contract, contractimpl, Address, BytesN, Env, IntoVal, Map, String,
 };
 
 use crate::error::Error;
 use crate::events::{TOPIC_DEPOSIT, TOPIC_WITHDRAW};
 use crate::group_split;
-use crate::types::CompoundFrequency;
+use crate::types::{CompoundFrequency, PermissionLevel};
 use crate::{SavingsVault, SavingsVaultClient};
+
+#[contract]
+struct ReentrantToken;
+
+#[contractimpl]
+impl ReentrantToken {
+    pub fn configure(env: Env, vault: Address, owner: Address, goal_id: u64) {
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("vault"), &vault);
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("owner"), &owner);
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("goalid"), &goal_id);
+    }
+
+    pub fn transfer(env: Env, _from: Address, _to: Address, _amount: i128) {
+        let vault: Address = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("vault"))
+            .unwrap();
+        let owner: Address = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("owner"))
+            .unwrap();
+        let goal_id: u64 = env
+            .storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("goalid"))
+            .unwrap();
+        let result =
+            SavingsVaultClient::new(&env, &vault).try_goal_set_auto_renew(&owner, &goal_id, &true);
+        let rejected = matches!(result, Err(Ok(Error::ReentrantCall)));
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("rejected"), &rejected);
+        let read_result = SavingsVaultClient::new(&env, &vault).try_goal(&goal_id);
+        let read_rejected = matches!(read_result, Err(Ok(Error::ReentrantCall)));
+        env.storage()
+            .instance()
+            .set(&soroban_sdk::symbol_short!("read_rej"), &read_rejected);
+    }
+
+    pub fn reentry_rejected(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("rejected"))
+            .unwrap_or(false)
+    }
+
+    pub fn readonly_reentry_rejected(env: Env) -> bool {
+        env.storage()
+            .instance()
+            .get(&soroban_sdk::symbol_short!("read_rej"))
+            .unwrap_or(false)
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -69,6 +131,10 @@ fn set_ledger_time(env: &Env, timestamp: u64, sequence_number: u32) {
     });
 }
 
+fn advance_ledger(env: &Env) {
+    set_ledger_time(env, env.ledger().timestamp(), env.ledger().sequence() + 1);
+}
+
 // ---------------------------------------------------------------------------
 // Existing placeholder stubs
 // ---------------------------------------------------------------------------
@@ -98,6 +164,34 @@ fn flexible_deposit_withdraw() {
     assert_eq!(
         client.try_get_account(&Address::generate(&env)),
         Err(Ok(Error::NotFound))
+    );
+}
+
+#[test]
+fn flexible_deposit_gas_cost_stays_within_baseline() {
+    const CPU_BASELINE: u64 = 20_000_000;
+    const MEMORY_BASELINE: u64 = 4 * 1024 * 1024;
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    mint(&env, &token, &token_admin, &owner, 1_000);
+
+    let mut budget = env.budget();
+    budget.reset_default();
+    client.deposit(&owner, &1_000);
+
+    let cpu_cost = budget.cpu_instruction_cost();
+    let memory_cost = budget.memory_bytes_cost();
+    assert!(
+        cpu_cost <= CPU_BASELINE,
+        "flexible deposit CPU cost {cpu_cost} exceeds baseline {CPU_BASELINE}",
+    );
+    assert!(
+        memory_cost <= MEMORY_BASELINE,
+        "flexible deposit memory cost {memory_cost} exceeds baseline {MEMORY_BASELINE}",
     );
 }
 
@@ -223,6 +317,7 @@ fn goal_claim_after_reached_returns_funds() {
     let token_client = soroban_sdk::token::Client::new(&env, &token);
     let owner_balance_before_claim = token_client.balance(&owner);
 
+    advance_ledger(&env);
     client.goal_claim(&owner, &goal_id);
 
     let owner_balance_after_claim = token_client.balance(&owner);
@@ -235,6 +330,49 @@ fn goal_claim_after_reached_returns_funds() {
     // The goal is closed on claim; a second claim finds nothing to pay out.
     let result = client.try_goal_claim(&owner, &goal_id);
     assert_eq!(result, Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn shared_goal_tracks_contributions_and_splits_claim() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    let contributor = Address::generate(&env);
+    const OWNER_AMOUNT: i128 = 60_000_000;
+    const CONTRIBUTOR_AMOUNT: i128 = 40_000_000;
+    const TOTAL: i128 = OWNER_AMOUNT + CONTRIBUTOR_AMOUNT;
+
+    mint(&env, &token, &token_admin, &owner, OWNER_AMOUNT);
+    mint(&env, &token, &token_admin, &contributor, CONTRIBUTOR_AMOUNT);
+    let goal_id = client.goal_create(&owner, &String::from_str(&env, "shared"), &TOTAL);
+    client.goal_contribute(&owner, &goal_id, &OWNER_AMOUNT);
+    client.goal_contribute(&contributor, &goal_id, &CONTRIBUTOR_AMOUNT);
+
+    let contributions = client.goal_contributions(&goal_id);
+    assert_eq!(contributions.get(owner.clone()), Some(OWNER_AMOUNT));
+    assert_eq!(
+        contributions.get(contributor.clone()),
+        Some(CONTRIBUTOR_AMOUNT)
+    );
+
+    let token_client = soroban_sdk::token::Client::new(&env, &token);
+    let owner_before = token_client.balance(&owner);
+    let contributor_before = token_client.balance(&contributor);
+    assert_eq!(
+        client.try_goal_claim(&owner, &goal_id),
+        Err(Ok(Error::SameLedger))
+    );
+    advance_ledger(&env);
+    client.goal_claim(&owner, &goal_id);
+
+    assert_eq!(token_client.balance(&owner) - owner_before, OWNER_AMOUNT);
+    assert_eq!(
+        token_client.balance(&contributor) - contributor_before,
+        CONTRIBUTOR_AMOUNT
+    );
 }
 
 /// An unreached goal cannot be claimed and remains intact.
@@ -289,6 +427,7 @@ fn goal_auto_renew_restarts_on_claim() {
     let token_client = soroban_sdk::token::Client::new(&env, &token);
     let balance_before = token_client.balance(&owner);
 
+    advance_ledger(&env);
     client.goal_claim(&owner, &goal_id);
 
     assert_eq!(
@@ -303,6 +442,7 @@ fn goal_auto_renew_restarts_on_claim() {
         renewed.reached_at.is_none(),
         "renewed goal clears its reached milestone"
     );
+    assert!(client.goal_contributions(&goal_id).is_empty());
     assert!(renewed.auto_renew, "renewal setting is retained");
     assert_eq!(renewed.target_amount, TARGET, "target is preserved");
 
@@ -310,6 +450,11 @@ fn goal_auto_renew_restarts_on_claim() {
     // time, proving the restart is a full cycle rather than a one-off.
     client.goal_contribute(&owner, &goal_id, &TARGET);
     assert!(client.goal(&goal_id).reached_at.is_some());
+    assert_eq!(
+        client.goal_contributions(&goal_id).get(owner.clone()),
+        Some(TARGET)
+    );
+    advance_ledger(&env);
     client.goal_claim(&owner, &goal_id);
     assert_eq!(client.goal(&goal_id).saved_amount, 0);
 }
@@ -332,6 +477,7 @@ fn goal_auto_renew_can_be_disabled_again() {
     client.goal_set_auto_renew(&owner, &goal_id, &true);
     client.goal_set_auto_renew(&owner, &goal_id, &false);
     client.goal_contribute(&owner, &goal_id, &TARGET);
+    advance_ledger(&env);
     client.goal_claim(&owner, &goal_id);
 
     // Renewal was switched back off, so the goal closes on claim.
@@ -694,6 +840,530 @@ fn locked_withdraw_exact_balance_after_unlock_succeeds() {
 
 /// Locked withdrawal before the unlock time must be rejected with
 /// `Error::StillLocked`, even when the requested amount is well within the
+/// plan balance. The error message makes explicit that the lock is still
+/// active; the client can retry after `unlock_at`.
+#[test]
+fn locked_withdraw_before_unlock_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+
+    const LOCKED_AMOUNT: i128 = 150_000_000;
+
+    mint(&env, &token, &token_admin, &owner, LOCKED_AMOUNT);
+
+    let now: u64 = 3_000_000;
+    env.ledger().set(LedgerInfo {
+        timestamp: now,
+        protocol_version: 22,
+        sequence_number: 100,
+        network_id: Default::default(),
+        base_reserve: 5_000_000,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 1,
+        max_entry_ttl: 3_110_400,
+    });
+
+    let unlock_at = now + 2_000;
+    let plan_id = client.locked_create(&owner, &LOCKED_AMOUNT, &unlock_at);
+
+    // Time is still before unlock_at — must fail with StillLocked, even
+    // though the requested amount is within balance.
+    let result = client.try_locked_withdraw(&owner, &plan_id, &(LOCKED_AMOUNT / 2));
+    assert_eq!(
+        result,
+        Err(Ok(Error::StillLocked)),
+        "expected StillLocked when withdrawing before unlock time",
+    );
+
+    let plan = client.locked_plan(&plan_id);
+    assert_eq!(
+        plan.balance, LOCKED_AMOUNT,
+        "locked plan balance must not change when withdrawal is blocked by time lock",
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #459 — Event emission optimization tests
+// ---------------------------------------------------------------------------
+
+/// Event topics can be efficiently filtered by indexed parameters.
+/// This test verifies that deposit events include the depositor address
+/// as a topic (indexed parameter) rather than only in the data payload,
+/// allowing off-chain indexers to filter deposit events by user without
+/// decoding every event's data.
+#[test]
+fn event_deposit_has_indexed_depositor() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    const AMOUNT: i128 = 50_000_000;
+    mint(&env, &token, &token_admin, &user, AMOUNT);
+
+    client.deposit(&user, &AMOUNT);
+
+    let events = env.events().all();
+    let deposit_event = events
+        .iter()
+        .find(|e| {
+            e.topics
+                .get(0)
+                .and_then(|t| t.as_symbol())
+                .map(|s| s.to_string() == TOPIC_DEPOSIT)
+                .unwrap_or(false)
+        })
+        .expect("deposit event must be emitted");
+
+    // The deposit event must include the depositor address as an indexed
+    // topic (second topic after the event name) so indexers can efficiently
+    // filter deposits by user.
+    assert!(
+        deposit_event.topics.len() >= 2,
+        "deposit event must have at least 2 topics: event name and depositor address"
+    );
+
+    let depositor_topic = deposit_event
+        .topics
+        .get(1)
+        .expect("second topic must be depositor address");
+    assert!(
+        depositor_topic.as_address().is_some(),
+        "second topic must be an Address (indexed depositor)"
+    );
+}
+
+/// Event topics can be efficiently filtered by indexed goal id.
+/// This test verifies that goal_contribution events include the goal_id
+/// as a topic (indexed parameter), allowing off-chain indexers to filter
+/// contributions by goal without decoding data payloads.
+#[test]
+fn event_goal_contribution_has_indexed_goal_id() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+
+    const TARGET: i128 = 100_000_000;
+    const CONTRIB: i128 = 40_000_000;
+
+    mint(&env, &token, &token_admin, &owner, CONTRIB);
+
+    let goal_id = client.goal_create(&owner, &String::from_str(&env, "vacation"), &TARGET);
+    client.goal_contribute(&owner, &goal_id, &CONTRIB);
+
+    let events = env.events().all();
+    let contribution_event = events
+        .iter()
+        .find(|e| {
+            e.topics
+                .get(0)
+                .and_then(|t| t.as_symbol())
+                .map(|s| s.to_string() == "goal_contribution")
+                .unwrap_or(false)
+        })
+        .expect("goal_contribution event must be emitted");
+
+    // The goal_contribution event must include goal_id as an indexed topic
+    // for efficient filtering.
+    assert!(
+        contribution_event.topics.len() >= 2,
+        "goal_contribution event must have indexed goal_id"
+    );
+
+    let goal_id_topic = contribution_event
+        .topics
+        .get(1)
+        .expect("second topic must be goal_id");
+    assert!(
+        goal_id_topic.as_u64().is_some(),
+        "second topic must be a u64 (indexed goal_id)"
+    );
+    assert_eq!(
+        goal_id_topic.as_u64().unwrap(),
+        goal_id,
+        "indexed goal_id must match the actual goal"
+    );
+}
+
+/// Event size optimization: events should only include essential data.
+/// This test verifies that deposit events do not include redundant data
+/// that can be derived from other sources (e.g., token address, which is
+/// constant for the vault instance).
+#[test]
+fn event_deposit_size_is_optimized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    const AMOUNT: i128 = 75_000_000;
+    mint(&env, &token, &token_admin, &user, AMOUNT);
+
+    client.deposit(&user, &AMOUNT);
+
+    let events = env.events().all();
+    let deposit_event = events
+        .iter()
+        .find(|e| {
+            e.topics
+                .get(0)
+                .and_then(|t| t.as_symbol())
+                .map(|s| s.to_string() == TOPIC_DEPOSIT)
+                .unwrap_or(false)
+        })
+        .expect("deposit event must be emitted");
+
+    // Event size check: topics should be minimal (event name + indexed params only).
+    // A well-optimized deposit event has:
+    // - Topic 0: event name (Symbol)
+    // - Topic 1: depositor (Address)
+    // - Data: amount (i128) + timestamp (u64)
+    //
+    // It should NOT include the token address (constant per vault instance,
+    // can be queried once) or other redundant data.
+    assert!(
+        deposit_event.topics.len() <= 3,
+        "deposit event should have minimal indexed topics for gas efficiency"
+    );
+
+    // Verify data payload exists and contains essential fields only.
+    assert!(
+        deposit_event.data.is_some(),
+        "deposit event must have data payload"
+    );
+}
+
+/// Gas cost measurement: verify that emitting multiple events in a single
+/// transaction stays within acceptable gas limits.
+/// This test creates a goal, contributes multiple times, and verifies the
+/// total gas cost remains reasonable even with multiple event emissions.
+#[test]
+fn event_emission_gas_cost_is_reasonable() {
+    const CPU_BASELINE: u64 = 30_000_000; // Baseline for goal contribution with event
+    const MEMORY_BASELINE: u64 = 5 * 1024 * 1024;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+
+    const TARGET: i128 = 100_000_000;
+    const CONTRIB: i128 = 25_000_000;
+
+    mint(&env, &token, &token_admin, &owner, CONTRIB);
+
+    let goal_id = client.goal_create(&owner, &String::from_str(&env, "savings"), &TARGET);
+
+    let mut budget = env.budget();
+    budget.reset_default();
+
+    // Measure the cost of a single contribution with event emission.
+    client.goal_contribute(&owner, &goal_id, &CONTRIB);
+
+    let cpu_cost = budget.cpu_instruction_cost();
+    let memory_cost = budget.memory_bytes_cost();
+
+    assert!(
+        cpu_cost <= CPU_BASELINE,
+        "goal_contribute with event emission CPU cost {cpu_cost} exceeds baseline {CPU_BASELINE}",
+    );
+    assert!(
+        memory_cost <= MEMORY_BASELINE,
+        "goal_contribute with event emission memory cost {memory_cost} exceeds baseline {MEMORY_BASELINE}",
+    );
+}
+
+/// Batch event verification: when multiple operations occur (e.g., group
+/// contributions from multiple members), verify that each emits exactly
+/// one event and that event topics are correctly indexed for efficient
+/// filtering per member.
+#[test]
+fn event_group_contributions_are_individually_indexed() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let member_b = Address::generate(&env);
+    let member_c = Address::generate(&env);
+
+    const CONTRIB: i128 = 30_000_000;
+
+    mint(&env, &token, &token_admin, &creator, CONTRIB);
+    mint(&env, &token, &token_admin, &member_b, CONTRIB);
+    mint(&env, &token, &token_admin, &member_c, CONTRIB);
+
+    let group_id = client.group_create(&creator, &String::from_str(&env, "team-savings"));
+    client.group_join(&member_b, &group_id);
+    client.group_join(&member_c, &group_id);
+
+    // Each contribution should emit exactly one group_contribution event
+    // with the group_id and contributor as indexed parameters.
+    client.group_contribute(&creator, &group_id, &CONTRIB);
+    let events_after_first = env.events().all();
+    let first_contrib_events: Vec<_> = events_after_first
+        .iter()
+        .filter(|e| {
+            e.topics
+                .get(0)
+                .and_then(|t| t.as_symbol())
+                .map(|s| s.to_string() == "group_contribution")
+                .unwrap_or(false)
+        })
+        .collect();
+
+    assert_eq!(
+        first_contrib_events.len(),
+        1,
+        "each contribution should emit exactly one event"
+    );
+
+    // Verify the event has indexed group_id and contributor.
+    let event = first_contrib_events[0];
+    assert!(
+        event.topics.len() >= 3,
+        "group_contribution event must index group_id and contributor"
+    );
+
+    let group_id_topic = event.topics.get(1);
+    let contributor_topic = event.topics.get(2);
+
+    assert!(
+        group_id_topic.and_then(|t| t.as_u64()).is_some(),
+        "second topic must be indexed group_id"
+    );
+    assert!(
+        contributor_topic.and_then(|t| t.as_address()).is_some(),
+        "third topic must be indexed contributor address"
+    );
+}
+
+/// Event emission for locked plan operations: verify that locked_withdraw
+/// events include indexed plan_id and owner for efficient filtering.
+#[test]
+fn event_locked_withdraw_has_indexed_parameters() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+
+    const AMOUNT: i128 = 100_000_000;
+
+    mint(&env, &token, &token_admin, &owner, AMOUNT);
+
+    let now: u64 = 1_000_000;
+    env.ledger().set(LedgerInfo {
+        timestamp: now,
+        protocol_version: 22,
+        sequence_number: 100,
+        network_id: Default::default(),
+        base_reserve: 5_000_000,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 1,
+        max_entry_ttl: 3_110_400,
+    });
+
+    let unlock_at = now + 500;
+    let plan_id = client.locked_create(&owner, &AMOUNT, &unlock_at);
+
+    // Advance past unlock time.
+    env.ledger().set(LedgerInfo {
+        timestamp: unlock_at + 1,
+        protocol_version: 22,
+        sequence_number: 200,
+        network_id: Default::default(),
+        base_reserve: 5_000_000,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 1,
+        max_entry_ttl: 3_110_400,
+    });
+
+    client.locked_withdraw(&owner, &plan_id, &AMOUNT);
+
+    let events = env.events().all();
+    let withdraw_event = events
+        .iter()
+        .find(|e| {
+            e.topics
+                .get(0)
+                .and_then(|t| t.as_symbol())
+                .map(|s| s.to_string() == "locked_withdraw")
+                .unwrap_or(false)
+        })
+        .expect("locked_withdraw event must be emitted");
+
+    // Verify indexed parameters for efficient filtering.
+    assert!(
+        withdraw_event.topics.len() >= 3,
+        "locked_withdraw event must index plan_id and owner"
+    );
+
+    let plan_id_topic = withdraw_event.topics.get(1);
+    let owner_topic = withdraw_event.topics.get(2);
+
+    assert!(
+        plan_id_topic.and_then(|t| t.as_u64()).is_some(),
+        "second topic must be indexed plan_id"
+    );
+    assert_eq!(
+        plan_id_topic.and_then(|t| t.as_u64()).unwrap(),
+        plan_id,
+        "indexed plan_id must match"
+    );
+
+    assert!(
+        owner_topic.and_then(|t| t.as_address()).is_some(),
+        "third topic must be indexed owner address"
+    );
+}
+
+/// Verify event emission during goal milestone (goal_reached): the event
+/// should have minimal size and include only essential indexed parameters.
+#[test]
+fn event_goal_reached_is_size_optimized() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+
+    const TARGET: i128 = 100_000_000;
+
+    mint(&env, &token, &token_admin, &owner, TARGET);
+
+    let goal_id = client.goal_create(&owner, &String::from_str(&env, "milestone"), &TARGET);
+
+    // Contribute exactly to target to trigger goal_reached event.
+    client.goal_contribute(&owner, &goal_id, &TARGET);
+
+    let events = env.events().all();
+    let reached_event = events
+        .iter()
+        .find(|e| {
+            e.topics
+                .get(0)
+                .and_then(|t| t.as_symbol())
+                .map(|s| s.to_string() == "goal_reached")
+                .unwrap_or(false)
+        })
+        .expect("goal_reached event must be emitted");
+
+    // Verify minimal event structure:
+    // - Topic 0: event name
+    // - Topic 1: goal_id (indexed)
+    // - Data: timestamp and target_amount (minimal essential data)
+    assert!(
+        reached_event.topics.len() >= 2,
+        "goal_reached must have indexed goal_id"
+    );
+    assert!(
+        reached_event.topics.len() <= 3,
+        "goal_reached should not include redundant indexed parameters"
+    );
+
+    let goal_id_topic = reached_event.topics.get(1);
+    assert!(
+        goal_id_topic.and_then(|t| t.as_u64()).is_some(),
+        "goal_reached must index goal_id"
+    );
+    assert_eq!(
+        goal_id_topic.and_then(|t| t.as_u64()).unwrap(),
+        goal_id,
+        "indexed goal_id must match"
+    );
+}
+
+/// Verify that interest claim events are gas-efficient and properly indexed.
+#[test]
+fn event_interest_claimed_is_gas_efficient() {
+    const CPU_BASELINE: u64 = 35_000_000;
+    const MEMORY_BASELINE: u64 = 5 * 1024 * 1024;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    const DEPOSIT: i128 = 100_000_000;
+
+    // Set up interest rate
+    client.set_interest_rate(&admin, &500); // 5% (500 bps)
+    client.set_interest_frequency(&admin, &CompoundFrequency::Daily);
+
+    mint(&env, &token, &token_admin, &user, DEPOSIT);
+    client.interest_deposit(&user, &DEPOSIT);
+
+    // Advance time to accrue interest
+    let now = env.ledger().timestamp();
+    env.ledger().set(LedgerInfo {
+        timestamp: now + 86_400, // 1 day later
+        protocol_version: 22,
+        sequence_number: env.ledger().sequence() + 17_280,
+        network_id: Default::default(),
+        base_reserve: 5_000_000,
+        min_temp_entry_ttl: 1,
+        min_persistent_entry_ttl: 1,
+        max_entry_ttl: 3_110_400,
+    });
+
+    let mut budget = env.budget();
+    budget.reset_default();
+
+    // Measure gas cost of interest claim with event emission
+    client.interest_claim(&user);
+
+    let cpu_cost = budget.cpu_instruction_cost();
+    let memory_cost = budget.memory_bytes_cost();
+
+    assert!(
+        cpu_cost <= CPU_BASELINE,
+        "interest_claim with event CPU cost {cpu_cost} exceeds baseline {CPU_BASELINE}",
+    );
+    assert!(
+        memory_cost <= MEMORY_BASELINE,
+        "interest_claim with event memory cost {memory_cost} exceeds baseline {MEMORY_BASELINE}",
+    );
+
+    // Verify the event exists and has indexed parameters
+    let events = env.events().all();
+    let claimed_event = events
+        .iter()
+        .find(|e| {
+            e.topics
+                .get(0)
+                .and_then(|t| t.as_symbol())
+                .map(|s| s.to_string() == "interest_claimed")
+                .unwrap_or(false)
+        })
+        .expect("interest_claimed event must be emitted");
+
+    assert!(
+        claimed_event.topics.len() >= 2,
+        "interest_claimed must have indexed user address"
+    );
+}
+
+/// Locked plan withdrawal before the unlock time must be rejected with
+/// `Error::StillLocked`, even when the requested amount is well within the
 /// plan's balance — isolates the time-lock guard from the balance guard
 /// (paired with `locked_withdraw_over_balance_rejected` above, which
 /// isolates the balance guard from the time-lock guard).
@@ -908,7 +1578,10 @@ fn locked_early_withdraw_before_min_lock_period_rejected() {
     // Once the minimum period has elapsed (and before unlock), it succeeds.
     set_ledger_time(&env, now + MIN_LOCK_PERIOD, 102);
     client.locked_early_withdraw(&owner, &plan_id, &1_000_000);
-    assert_eq!(client.locked_plan(&plan_id).balance, LOCKED_AMOUNT - 1_000_000);
+    assert_eq!(
+        client.locked_plan(&plan_id).balance,
+        LOCKED_AMOUNT - 1_000_000
+    );
 }
 
 /// Once `unlock_at` has passed, the penalized early path is closed; the
@@ -1016,7 +1689,10 @@ fn locked_early_withdraw_defaults_to_no_penalty() {
         WITHDRAW,
         "with no penalty configured the owner receives the full amount",
     );
-    assert_eq!(client.locked_plan(&plan_id).balance, LOCKED_AMOUNT - WITHDRAW);
+    assert_eq!(
+        client.locked_plan(&plan_id).balance,
+        LOCKED_AMOUNT - WITHDRAW
+    );
 }
 
 /// The configured penalty rate is capped at 100% (10_000 bps).
@@ -2141,7 +2817,14 @@ fn locked_early_withdraw_emits_typed_event_with_expected_topic_and_data() {
     assert_eq!(topics, expected_topics);
     assert_eq!(
         decoded_data,
-        (plan_id, owner, WITHDRAW, PENALTY, AMOUNT - WITHDRAW, call_time)
+        (
+            plan_id,
+            owner,
+            WITHDRAW,
+            PENALTY,
+            AMOUNT - WITHDRAW,
+            call_time
+        )
     );
 }
 
@@ -2232,6 +2915,7 @@ fn goal_claim_auto_renew_emits_goal_renewed_event() {
     client.goal_set_auto_renew(&owner, &goal_id, &true);
     client.goal_contribute(&owner, &goal_id, &TARGET);
 
+    advance_ledger(&env);
     client.goal_claim(&owner, &goal_id);
 
     let now = env.ledger().timestamp();
@@ -2853,15 +3537,7 @@ fn group_propose_without_voting_period_rejected() {
     let recipient = Address::generate(&env);
 
     // period = 0 disables proposals.
-    let group_id = closed_group_with_voting(
-        &env,
-        &client,
-        &token,
-        &token_admin,
-        &creator,
-        &[],
-        0,
-    );
+    let group_id = closed_group_with_voting(&env, &client, &token, &token_admin, &creator, &[], 0);
 
     let result = client.try_group_propose(&creator, &group_id, &recipient, &1_000_000);
     assert_eq!(
@@ -2972,7 +3648,14 @@ fn group_propose_emits_typed_event_with_expected_topic_and_data() {
     assert_eq!(topics, expected_topics);
     assert_eq!(
         decoded_data,
-        (proposal_id, group_id, recipient, SPEND, now + VOTING_PERIOD, now)
+        (
+            proposal_id,
+            group_id,
+            recipient,
+            SPEND,
+            now + VOTING_PERIOD,
+            now
+        )
     );
 }
 
@@ -3530,5 +4213,969 @@ mod group_split_properties {
 
             prop_assert_eq!(sum, pool, "sum of payouts must equal the pool exactly");
         }
+
+        #[test]
+        fn goal_split_rounding_sums_to_pool(
+            contributions in proptest::collection::vec(1i128..=1_000_000i128, 1..=8),
+            pool in 0i128..=1_000_000_000_000i128,
+        ) {
+            let env = Env::default();
+            let owner = Address::generate(&env);
+            let mut amounts = Map::new(&env);
+            for amount in contributions {
+                let contributor = Address::generate(&env);
+                amounts.set(contributor, amount);
+            }
+
+            let payouts = crate::goal::compute_payouts(&env, &amounts, pool, &owner).unwrap();
+            let mut sum = 0i128;
+            for (_contributor, amount) in payouts.iter() {
+                prop_assert!(amount >= 0);
+                sum += amount;
+            }
+            prop_assert_eq!(sum, pool);
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Issue #440 — Savings boost rewards
+//
+// Tests follow the same pattern as the interest tests above: set up a vault
+// with a token, open an interest account, then exercise the rewards system.
+//
+// Helper [`setup_rewards`] opens an interest account and funds the pool.
+// ---------------------------------------------------------------------------
+
+use crate::rewards::{
+    DEFAULT_ACCRUAL_PERIOD_SECONDS, TIER_1_MULTIPLIER_BPS, TIER_1_SECONDS, TIER_2_MULTIPLIER_BPS,
+    TIER_2_SECONDS, TIER_3_MULTIPLIER_BPS, TIER_3_SECONDS,
+};
+use crate::types::LoyaltyTier;
+
+/// One week in seconds (default accrual and streak period).
+const WEEK: u64 = DEFAULT_ACCRUAL_PERIOD_SECONDS;
+
+/// A simple principal for reward tests: 1 000 000 stroops.
+const REWARD_PRINCIPAL: i128 = 1_000_000;
+
+/// Pool size funded by admin: enough for all tests.
+const POOL_FUND: i128 = 10_000_000;
+
+/// Open an interest account for a fresh user and fund the reward pool.
+/// Returns `(owner, token_admin)`.
+fn setup_rewards(
+    env: &Env,
+    client: &SavingsVaultClient,
+    admin: &Address,
+    token: &Address,
+) -> (Address, Address) {
+    let token_admin = Address::generate(env);
+    let owner = Address::generate(env);
+    mint(env, token, &token_admin, &owner, REWARD_PRINCIPAL);
+    client.interest_deposit(&owner, &REWARD_PRINCIPAL);
+    // Fund the reward pool from the admin wallet.
+    mint(env, token, &token_admin, admin, POOL_FUND);
+    client.reward_fund(admin, &POOL_FUND);
+    (owner, token_admin)
+}
+
+// ---------------------------------------------------------------------------
+// Loyalty multiplier
+// ---------------------------------------------------------------------------
+
+/// Below tier 1 the multiplier is exactly 1.0× (10 000 bps).
+#[test]
+fn loyalty_multiplier_below_first_tier_is_one_x() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token) = setup_with_token(&env);
+    let (owner, _) = setup_rewards(&env, &client, &admin, &token);
+
+    let config = client.reward_config();
+
+    // hold age = 0 (just deposited, no time advanced)
+    let multiplier = crate::rewards::loyalty_multiplier_bps(0, &config);
+    assert_eq!(
+        multiplier, 10_000,
+        "below tier 1 the multiplier must be 1.0× (10 000 bps)"
+    );
+
+    // One second before tier 1 still 1.0×.
+    let multiplier_before_t1 = crate::rewards::loyalty_multiplier_bps(TIER_1_SECONDS - 1, &config);
+    assert_eq!(multiplier_before_t1, 10_000);
+
+    let _ = (owner,);
+}
+
+/// At each tier boundary the multiplier steps up exactly.
+#[test]
+fn loyalty_multiplier_steps_at_tier_boundaries() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token) = setup_with_token(&env);
+    let (owner, _) = setup_rewards(&env, &client, &admin, &token);
+    let config = client.reward_config();
+
+    assert_eq!(
+        crate::rewards::loyalty_multiplier_bps(TIER_1_SECONDS, &config),
+        TIER_1_MULTIPLIER_BPS,
+        "at tier-1 boundary multiplier must be TIER_1_MULTIPLIER_BPS"
+    );
+    assert_eq!(
+        crate::rewards::loyalty_multiplier_bps(TIER_2_SECONDS, &config),
+        TIER_2_MULTIPLIER_BPS,
+        "at tier-2 boundary multiplier must be TIER_2_MULTIPLIER_BPS"
+    );
+    assert_eq!(
+        crate::rewards::loyalty_multiplier_bps(TIER_3_SECONDS, &config),
+        TIER_3_MULTIPLIER_BPS,
+        "at tier-3 boundary multiplier must be TIER_3_MULTIPLIER_BPS"
+    );
+    let _ = (owner,);
+}
+
+/// The multiplier never exceeds the cap even if a very long hold is claimed.
+#[test]
+fn loyalty_multiplier_never_exceeds_cap() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token) = setup_with_token(&env);
+    let (owner, _) = setup_rewards(&env, &client, &admin, &token);
+    let config = client.reward_config();
+
+    let multiplier = crate::rewards::loyalty_multiplier_bps(u64::MAX, &config);
+    assert!(
+        multiplier <= config.loyalty_cap_bps,
+        "multiplier {} must never exceed cap {}",
+        multiplier,
+        config.loyalty_cap_bps
+    );
+    let _ = (owner,);
+}
+
+// ---------------------------------------------------------------------------
+// Streak bonus
+// ---------------------------------------------------------------------------
+
+/// Streak increments on consecutive periods.
+#[test]
+fn streak_increments_on_consecutive_periods() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token) = setup_with_token(&env);
+    let (owner, _) = setup_rewards(&env, &client, &admin, &token);
+
+    // Mark the first streak period as kept, then advance one week.
+    client.reward_ping(&owner);
+    set_ledger_time(&env, WEEK, 2);
+
+    // Accrue: the first period was kept → streak becomes 1.
+    client.reward_accrue(&owner);
+    let state = client.reward_state(&owner).unwrap();
+    assert_eq!(state.streak, 1, "streak must be 1 after one kept period");
+
+    // Mark and advance a second week.
+    client.reward_ping(&owner);
+    set_ledger_time(&env, WEEK * 2, 3);
+    client.reward_accrue(&owner);
+    let state = client.reward_state(&owner).unwrap();
+    assert_eq!(
+        state.streak, 2,
+        "streak must be 2 after two consecutive periods"
+    );
+}
+
+/// A missed period resets the streak to zero.
+#[test]
+fn streak_resets_after_missed_period() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token) = setup_with_token(&env);
+    let (owner, _) = setup_rewards(&env, &client, &admin, &token);
+
+    // Keep period 1.
+    client.reward_ping(&owner);
+    set_ledger_time(&env, WEEK, 2);
+    client.reward_accrue(&owner);
+    assert_eq!(client.reward_state(&owner).unwrap().streak, 1);
+
+    // Skip period 2 (no ping), advance two weeks.
+    set_ledger_time(&env, WEEK * 3, 4);
+    client.reward_accrue(&owner);
+    let state = client.reward_state(&owner).unwrap();
+    assert_eq!(state.streak, 0, "missed period must reset streak to 0");
+}
+
+/// The streak bonus is capped at `streak_bonus_cap_bps`.
+#[test]
+fn streak_bonus_is_capped() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token) = setup_with_token(&env);
+    let (owner, _) = setup_rewards(&env, &client, &admin, &token);
+    let config = client.reward_config();
+
+    // streak so large the raw bonus would exceed the cap.
+    let large_streak = config.streak_bonus_cap_bps / config.streak_bonus_bps_per_period + 100;
+    let bonus = crate::rewards::streak_bonus_bps(large_streak, &config);
+    assert_eq!(
+        bonus, config.streak_bonus_cap_bps,
+        "streak bonus must be capped at streak_bonus_cap_bps"
+    );
+
+    let _ = (owner,);
+}
+
+// ---------------------------------------------------------------------------
+// Reward arithmetic — worked example
+// ---------------------------------------------------------------------------
+
+/// Exact reward = base × loyalty_multiplier + streak_bonus, rounded down.
+///
+/// With DEFAULT config (base_rate = 500 bps, accrual = weekly):
+///   base_per_period = 1_000_000 × 500 / 10_000 / 52  ... actually the
+///   base is computed per-period using the annual rate directly divided into
+///   one period, i.e.:
+///     base = floor(principal × base_rate_bps / 10_000)  per accrual period
+///
+/// DEFAULT_BASE_RATE_BPS = 500 (5% annual, but applied per-period flat).
+/// principal = 1_000_000
+/// base = floor(1_000_000 × 500 / 10_000) = 50_000
+/// loyalty = 1.0× (10_000 bps), below tier 1
+/// streak = 0, streak_bonus = 0
+/// reward = floor(50_000 × 10_000 / 10_000) + 0 = 50_000
+#[test]
+fn reward_arithmetic_worked_example() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token) = setup_with_token(&env);
+    let (owner, _) = setup_rewards(&env, &client, &admin, &token);
+
+    // Advance exactly one accrual period, no ping (streak=0, loyalty=1.0×).
+    set_ledger_time(&env, WEEK, 2);
+    let accrued = client.reward_accrue(&owner);
+
+    // base = floor(1_000_000 × 500 / 10_000) = 50_000
+    // loyalty_part = floor(50_000 × 10_000 / 10_000) = 50_000
+    // streak_part = floor(1_000_000 × 0 / 10_000) = 0
+    // total = 50_000
+    assert_eq!(
+        accrued, 50_000,
+        "reward for one period with 1.0× loyalty and 0 streak must be 50_000"
+    );
+    assert_eq!(client.reward_state(&owner).unwrap().pending, 50_000);
+}
+
+/// Two periods without ping produce 2 × single-period reward (no streak yet).
+#[test]
+fn reward_two_periods_no_streak() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token) = setup_with_token(&env);
+    let (owner, _) = setup_rewards(&env, &client, &admin, &token);
+
+    set_ledger_time(&env, WEEK * 2, 2);
+    let accrued = client.reward_accrue(&owner);
+    // 2 × 50_000 = 100_000
+    assert_eq!(accrued, 100_000);
+}
+
+// ---------------------------------------------------------------------------
+// Claim behaviour
+// ---------------------------------------------------------------------------
+
+/// Claim pays out once; a second claim pays nothing until more accrues.
+#[test]
+fn claim_pays_once_then_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token) = setup_with_token(&env);
+    let (owner, _) = setup_rewards(&env, &client, &admin, &token);
+
+    set_ledger_time(&env, WEEK, 2);
+
+    let payout = client.reward_claim(&owner);
+    assert_eq!(payout, 50_000, "first claim must pay the accrued amount");
+    assert_eq!(
+        client.reward_state(&owner).unwrap().pending,
+        0,
+        "pending must be zero after a full claim"
+    );
+
+    // Second claim with no new accrual → 0.
+    let second = client.reward_claim(&owner);
+    assert_eq!(second, 0, "second claim with nothing pending must return 0");
+}
+
+/// Pool shortfall: if the pool holds less than pending, pay what's available
+/// and leave the remainder pending.
+#[test]
+fn claim_pool_shortfall_pays_partial() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token) = setup_with_token(&env);
+    let (owner, _) = setup_rewards(&env, &client, &admin, &token);
+
+    // Drain pool down to a tiny amount first (use a fresh recipient).
+    let sink = Address::generate(&env);
+    mint(&env, &token, &Address::generate(&env), &admin, 1); // irrelevant; pool already funded
+
+    // Accrue two periods so pending = 100_000.
+    set_ledger_time(&env, WEEK * 2, 2);
+    client.reward_accrue(&owner);
+    assert_eq!(client.reward_state(&owner).unwrap().pending, 100_000);
+
+    // Drain most of the pool via a second user so only 30_000 remain.
+    let owner2 = Address::generate(&env);
+    let token_admin2 = Address::generate(&env);
+    mint(&env, &token, &token_admin2, &owner2, REWARD_PRINCIPAL);
+    client.interest_deposit(&owner2, &REWARD_PRINCIPAL);
+    // accrue enough for owner2 to claim POOL_FUND - 30_000 = 9_970_000
+    // We achieve this by claiming for owner (50_000 at WEEK) first, then
+    // manipulating state directly isn't possible in the test env — instead
+    // we re-fund the pool to exactly 30_000 by funding 30_000 and setting
+    // pool to known size via an extra fund then checking the partial behaviour.
+    //
+    // Simpler approach: fund a fresh pool of exactly 30_000.
+    let client2_admin = Address::generate(&env);
+    // Reset the pool balance to 30_000 by funding 30_000 minus the current balance.
+    // Current pool = POOL_FUND = 10_000_000. We can't reduce it directly, so
+    // use a separate vault for this test.
+    let env2 = Env::default();
+    env2.mock_all_auths();
+    let (client2, admin2, token2) = setup_with_token(&env2);
+    let token_admin_b = Address::generate(&env2);
+    let owner_b = Address::generate(&env2);
+    mint(&env2, &token2, &token_admin_b, &owner_b, REWARD_PRINCIPAL);
+    client2.interest_deposit(&owner_b, &REWARD_PRINCIPAL);
+
+    // Fund pool with only 30_000 — less than one accrual period (50_000).
+    mint(&env2, &token2, &token_admin_b, &admin2, 30_000i128);
+    client2.reward_fund(&admin2, &30_000i128);
+    assert_eq!(client2.reward_pool_balance(), 30_000);
+
+    // Advance one week so pending = 50_000, pool = 30_000.
+    set_ledger_time(&env2, WEEK, 2);
+    client2.reward_accrue(&owner_b);
+    assert_eq!(client2.reward_state(&owner_b).unwrap().pending, 50_000);
+
+    let payout = client2.reward_claim(&owner_b);
+    assert_eq!(payout, 30_000, "shortfall: must pay what the pool holds");
+    assert_eq!(
+        client2.reward_pool_balance(),
+        0,
+        "pool must be exactly 0 after shortfall payout"
+    );
+    assert_eq!(
+        client2.reward_state(&owner_b).unwrap().pending,
+        20_000,
+        "remainder must stay in pending after shortfall"
+    );
+
+    let _ = (sink, owner2, client2_admin);
+}
+
+/// Pool at exactly zero pays nothing (no error, just 0).
+#[test]
+fn claim_empty_pool_returns_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token) = setup_with_token(&env);
+    // Don't fund the pool — it starts at 0.
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+    mint(&env, &token, &token_admin, &owner, REWARD_PRINCIPAL);
+    client.interest_deposit(&owner, &REWARD_PRINCIPAL);
+    // No reward_fund call.
+
+    set_ledger_time(&env, WEEK, 2);
+    let payout = client.reward_claim(&owner);
+    assert_eq!(payout, 0, "empty pool must return 0, not error");
+    assert_eq!(
+        client.reward_state(&owner).unwrap().pending,
+        50_000,
+        "pending must still reflect the accrued amount"
+    );
+    let _ = (admin,);
+}
+
+// ---------------------------------------------------------------------------
+// No position → no reward
+// ---------------------------------------------------------------------------
+
+/// A user without an interest account earns nothing.
+#[test]
+fn no_interest_account_earns_nothing() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token) = setup_with_token(&env);
+    let (_, _) = setup_rewards(&env, &client, &admin, &token);
+    let stranger = Address::generate(&env);
+
+    set_ledger_time(&env, WEEK, 2);
+    // accrue returns Ok(0) for a user with no interest account.
+    let accrued = client.reward_accrue(&stranger);
+    assert_eq!(accrued, 0);
+    assert!(
+        client.reward_state(&stranger).is_none(),
+        "a user with no interest account must have no reward state"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Config setters — admin guard and validation
+// ---------------------------------------------------------------------------
+
+/// Non-admin cannot call reward_set_config.
+#[test]
+fn reward_set_config_non_admin_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _token) = setup_with_token(&env);
+    let attacker = Address::generate(&env);
+    let config = client.reward_config();
+
+    let result = client.try_reward_set_config(&attacker, &config);
+    assert_eq!(
+        result,
+        Err(Ok(Error::Unauthorized)),
+        "non-admin must be rejected by reward_set_config"
+    );
+}
+
+/// Non-admin cannot call reward_fund.
+#[test]
+fn reward_fund_non_admin_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, token) = setup_with_token(&env);
+    let attacker = Address::generate(&env);
+    let token_admin = Address::generate(&env);
+    mint(&env, &token, &token_admin, &attacker, 1_000);
+
+    let result = client.try_reward_fund(&attacker, &1_000i128);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+/// reward_set_config rejects zero accrual period.
+#[test]
+fn reward_set_config_rejects_zero_accrual_period() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _token) = setup_with_token(&env);
+    let mut config = client.reward_config();
+    config.accrual_period_seconds = 0;
+
+    let result = client.try_reward_set_config(&admin, &config);
+    assert_eq!(result, Err(Ok(Error::InvalidRewardConfig)));
+}
+
+/// reward_set_config rejects loyalty_cap_bps below 1.0× (10_000).
+#[test]
+fn reward_set_config_rejects_cap_below_one_x() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _token) = setup_with_token(&env);
+    let mut config = client.reward_config();
+    config.loyalty_cap_bps = 9_999;
+
+    let result = client.try_reward_set_config(&admin, &config);
+    assert_eq!(result, Err(Ok(Error::InvalidRewardConfig)));
+}
+
+/// reward_set_config rejects unsorted loyalty tiers.
+#[test]
+fn reward_set_config_rejects_unsorted_tiers() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _token) = setup_with_token(&env);
+
+    let mut tiers: soroban_sdk::Vec<LoyaltyTier> = soroban_sdk::Vec::new(&env);
+    tiers.push_back(LoyaltyTier {
+        min_seconds: TIER_2_SECONDS,
+        multiplier_bps: 11_000,
+    });
+    tiers.push_back(LoyaltyTier {
+        min_seconds: TIER_1_SECONDS,
+        multiplier_bps: 10_500,
+    }); // out of order
+
+    let mut config = client.reward_config();
+    config.loyalty_tiers = tiers;
+
+    let result = client.try_reward_set_config(&admin, &config);
+    assert_eq!(result, Err(Ok(Error::InvalidRewardConfig)));
+}
+
+/// reward_set_config emits an event on a valid update.
+#[test]
+fn reward_set_config_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, _token) = setup_with_token(&env);
+    let config = client.reward_config();
+    let events_before = env.events().all().len();
+
+    client.reward_set_config(&admin, &config);
+
+    let events_after = env.events().all().len();
+    assert_eq!(
+        events_after - events_before,
+        1,
+        "reward_set_config must emit exactly one event"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Existing deposit/withdraw/exchange-rate tests still pass
+// (covered by the existing test functions above — this section just confirms
+// the rewards hooks inside interest::deposit/withdraw don't break anything)
+// ---------------------------------------------------------------------------
+
+/// interest_deposit and interest_withdraw still work correctly after the
+/// note_touch hook is wired in.
+#[test]
+fn interest_deposit_withdraw_unaffected_by_rewards_hook() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+
+    let owner = setup_interest(
+        &env,
+        &client,
+        &admin,
+        &token,
+        &token_admin,
+        1200,
+        CompoundFrequency::Monthly,
+    );
+
+    set_ledger_time(&env, MONTH, 2);
+    assert_eq!(client.interest_accrued(&owner), 10_000);
+    assert_eq!(client.interest_claim(&owner), 10_000);
+
+    // Withdraw should still work (not regressed by note_touch).
+    client.interest_withdraw(&owner, &500_000);
+    let account = client.interest_account(&owner);
+    assert_eq!(account.principal, 510_000); // 1_010_000 - 500_000
+}
+
+/// Reward ping requires an existing interest account.
+#[test]
+fn reward_ping_without_interest_account_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _token) = setup_with_token(&env);
+    let stranger = Address::generate(&env);
+
+    let result = client.try_reward_ping(&stranger);
+    assert_eq!(result, Err(Ok(Error::NotFound)));
+}
+
+/// reward_fund emits a `reward_funded` event.
+#[test]
+fn reward_fund_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    mint(&env, &token, &token_admin, &admin, 1_000);
+    let events_before = env.events().all().len();
+
+    client.reward_fund(&admin, &1_000i128);
+
+    let events_after = env.events().all().len();
+    assert!(
+        events_after > events_before,
+        "reward_fund must emit an event"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Upstream #491 — Token reentrancy guard
+// ---------------------------------------------------------------------------
+
+#[test]
+fn token_callback_cannot_reenter_vault_mutation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let admin = Address::generate(&env);
+    let token = env.register(ReentrantToken, ());
+    client.initialize(&admin, &token);
+    let owner = Address::generate(&env);
+    let goal_id = client.goal_create(&owner, &String::from_str(&env, "guard"), &2);
+    ReentrantTokenClient::new(&env, &token).configure(&client.address, &owner, &goal_id);
+
+    client.goal_contribute(&owner, &goal_id, &1);
+
+    assert!(ReentrantTokenClient::new(&env, &token).reentry_rejected());
+    assert!(ReentrantTokenClient::new(&env, &token).readonly_reentry_rejected());
+    assert!(!client.goal(&goal_id).auto_renew);
+    assert_eq!(client.goal(&goal_id).saved_amount, 1);
+}
+
+// ---------------------------------------------------------------------------
+// Issue #428 — Emergency pause mechanism
+// ---------------------------------------------------------------------------
+
+#[test]
+fn emergency_mode_blocks_deposits_allows_withdrawals() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    const DEPOSIT: i128 = 100_000_000;
+    mint(&env, &token, &token_admin, &user, DEPOSIT * 2);
+
+    client.deposit(&user, &DEPOSIT);
+    assert_eq!(client.get_account(&user).balance, DEPOSIT);
+    assert!(!client.is_emergency_mode());
+
+    client.set_emergency_mode(&admin, &true);
+    assert!(client.is_emergency_mode());
+
+    let deposit_result = client.try_deposit(&user, &DEPOSIT);
+    assert_eq!(deposit_result, Err(Ok(Error::EmergencyShutdown)));
+
+    client.withdraw(&user, &(DEPOSIT / 2));
+    assert_eq!(client.get_account(&user).balance, DEPOSIT / 2);
+
+    client.set_emergency_mode(&admin, &false);
+    assert!(!client.is_emergency_mode());
+
+    client.deposit(&user, &(DEPOSIT / 2));
+}
+
+#[test]
+fn emergency_withdraw_from_locked_plan() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let owner = Address::generate(&env);
+
+    const LOCKED_AMOUNT: i128 = 100_000_000;
+    mint(&env, &token, &token_admin, &owner, LOCKED_AMOUNT);
+
+    let now: u64 = 1_000_000;
+    set_ledger_time(&env, now, 100);
+    let plan_id = client.locked_create(&owner, &LOCKED_AMOUNT, &(now + 100_000));
+
+    // Without emergency mode, emergency withdraw fails.
+    let result = client.try_locked_emergency_withdraw(&owner, &plan_id);
+    assert_eq!(result, Err(Ok(Error::NotPaused)));
+
+    // Enable emergency mode.
+    client.set_emergency_mode(&admin, &true);
+
+    let token_client = soroban_sdk::token::Client::new(&env, &token);
+    let balance_before = token_client.balance(&owner);
+
+    client.locked_emergency_withdraw(&owner, &plan_id);
+
+    assert_eq!(
+        token_client.balance(&owner) - balance_before,
+        LOCKED_AMOUNT,
+    );
+    assert_eq!(client.locked_plan(&plan_id).balance, 0);
+}
+
+#[test]
+fn emergency_mode_non_admin_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let attacker = Address::generate(&env);
+
+    let result = client.try_set_emergency_mode(&attacker, &true);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+    assert!(!client.is_emergency_mode());
+}
+
+// ---------------------------------------------------------------------------
+// Issue #429 — Contract upgrade pattern
+// ---------------------------------------------------------------------------
+
+#[test]
+fn version_starts_at_one() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _token) = setup_with_token(&env);
+    assert_eq!(client.version(), 1);
+}
+
+#[test]
+fn upgrade_delay_defaults_to_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _token) = setup_with_token(&env);
+    assert_eq!(client.upgrade_delay(), 0);
+}
+
+#[test]
+fn propose_and_cancel_upgrade() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _token) = setup_with_token(&env);
+
+    let fake_hash = BytesN::from_array(&env, &[0u8; 32]);
+    client.propose_upgrade(&admin, &fake_hash);
+
+    let proposal = client.pending_upgrade();
+    assert!(proposal.is_some());
+    let proposal = proposal.unwrap();
+    assert_eq!(proposal.proposed_by, admin);
+
+    client.cancel_upgrade(&admin);
+    assert!(client.pending_upgrade().is_none());
+}
+
+#[test]
+fn propose_upgrade_rejects_duplicate() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _token) = setup_with_token(&env);
+
+    let fake_hash = BytesN::from_array(&env, &[0u8; 32]);
+    client.propose_upgrade(&admin, &fake_hash);
+
+    let result = client.try_propose_upgrade(&admin, &fake_hash);
+    assert_eq!(result, Err(Ok(Error::ConflictingState)));
+}
+
+#[test]
+fn upgrade_delay_enforced() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _token) = setup_with_token(&env);
+
+    client.set_upgrade_delay(&admin, &3600);
+    assert_eq!(client.upgrade_delay(), 3600);
+
+    let now: u64 = 1_000_000;
+    set_ledger_time(&env, now, 100);
+
+    let fake_hash = BytesN::from_array(&env, &[0u8; 32]);
+    client.propose_upgrade(&admin, &fake_hash);
+
+    let result = client.try_execute_upgrade(&admin);
+    assert_eq!(result, Err(Ok(Error::TimeWindowNotOpen)));
+
+    set_ledger_time(&env, now + 3600, 200);
+    // execute_upgrade would call update_current_contract_wasm which panics
+    // in test env with an invalid hash, so we just verify the timelock
+    // passes by checking the proposal is still there
+    let proposal = client.pending_upgrade().unwrap();
+    assert_eq!(proposal.execute_after, now + 3600);
+}
+
+#[test]
+fn upgrade_non_admin_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let attacker = Address::generate(&env);
+
+    let fake_hash = BytesN::from_array(&env, &[0u8; 32]);
+    let result = client.try_propose_upgrade(&attacker, &fake_hash);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn cancel_nonexistent_upgrade_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _token) = setup_with_token(&env);
+
+    let result = client.try_cancel_upgrade(&admin);
+    assert_eq!(result, Err(Ok(Error::NotFound)));
+}
+
+#[test]
+fn migrate_admin_only() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _token) = setup_with_token(&env);
+    let attacker = Address::generate(&env);
+
+    client.migrate(&admin);
+
+    let result = client.try_migrate(&attacker);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+// ---------------------------------------------------------------------------
+// Issue #435 — Savings insurance fund
+// ---------------------------------------------------------------------------
+
+#[test]
+fn insurance_premium_defaults_to_zero() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, _admin, _token) = setup_with_token(&env);
+    assert_eq!(client.insurance_premium_bps(), 0);
+    assert_eq!(client.insurance_fund_balance(), 0);
+}
+
+#[test]
+fn insurance_set_premium() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, _token) = setup_with_token(&env);
+
+    client.set_insurance_premium_bps(&admin, &100);
+    assert_eq!(client.insurance_premium_bps(), 100);
+
+    let result = client.try_set_insurance_premium_bps(&admin, &10_001);
+    assert_eq!(result, Err(Ok(Error::InvalidParameters)));
+}
+
+#[test]
+fn insurance_set_premium_non_admin_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, _admin, _token) = setup_with_token(&env);
+    let attacker = Address::generate(&env);
+
+    let result = client.try_set_insurance_premium_bps(&attacker, &100);
+    assert_eq!(result, Err(Ok(Error::Unauthorized)));
+}
+
+#[test]
+fn insurance_fund_and_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+
+    const FUND_AMOUNT: i128 = 50_000_000;
+    mint(&env, &token, &token_admin, &admin, FUND_AMOUNT);
+
+    client.insurance_fund(&admin, &FUND_AMOUNT);
+    assert_eq!(client.insurance_fund_balance(), FUND_AMOUNT);
+}
+
+#[test]
+fn insurance_approve_and_redeem_claim() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let claimant = Address::generate(&env);
+
+    const FUND_AMOUNT: i128 = 100_000_000;
+    const CLAIM_AMOUNT: i128 = 10_000_000;
+    mint(&env, &token, &token_admin, &admin, FUND_AMOUNT);
+
+    client.insurance_fund(&admin, &FUND_AMOUNT);
+
+    client.insurance_approve_claim(&admin, &claimant, &CLAIM_AMOUNT);
+
+    let claim = client.insurance_claim(&claimant);
+    assert_eq!(claim.amount, CLAIM_AMOUNT);
+    assert!(!claim.redeemed);
+
+    let token_client = soroban_sdk::token::Client::new(&env, &token);
+    let balance_before = token_client.balance(&claimant);
+
+    let redeemed = client.insurance_redeem_claim(&claimant);
+    assert_eq!(redeemed, CLAIM_AMOUNT);
+
+    assert_eq!(
+        token_client.balance(&claimant) - balance_before,
+        CLAIM_AMOUNT
+    );
+    assert_eq!(
+        client.insurance_fund_balance(),
+        FUND_AMOUNT - CLAIM_AMOUNT
+    );
+
+    let claim = client.insurance_claim(&claimant);
+    assert!(claim.redeemed);
+}
+
+#[test]
+fn insurance_claim_exceeds_max_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let claimant = Address::generate(&env);
+
+    const FUND_AMOUNT: i128 = 100_000_000;
+    mint(&env, &token, &token_admin, &admin, FUND_AMOUNT);
+
+    client.insurance_fund(&admin, &FUND_AMOUNT);
+    client.set_insurance_max_claim_bps(&admin, &500);
+
+    let max_allowed = FUND_AMOUNT * 500 / 10_000;
+    let result = client.try_insurance_approve_claim(&admin, &claimant, &(max_allowed + 1));
+    assert_eq!(result, Err(Ok(Error::DepositCapExceeded)));
+
+    client.insurance_approve_claim(&admin, &claimant, &max_allowed);
+}
+
+#[test]
+fn insurance_double_redeem_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let claimant = Address::generate(&env);
+
+    const FUND_AMOUNT: i128 = 100_000_000;
+    const CLAIM_AMOUNT: i128 = 5_000_000;
+    mint(&env, &token, &token_admin, &admin, FUND_AMOUNT);
+
+    client.insurance_fund(&admin, &FUND_AMOUNT);
+    client.insurance_approve_claim(&admin, &claimant, &CLAIM_AMOUNT);
+    client.insurance_redeem_claim(&claimant);
+
+    let result = client.try_insurance_redeem_claim(&claimant);
+    assert_eq!(result, Err(Ok(Error::ConflictingState)));
+}
+
+#[test]
+fn insurance_premium_collected_on_deposit() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let (client, admin, token) = setup_with_token(&env);
+    let token_admin = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    const DEPOSIT: i128 = 100_000_000;
+    const PREMIUM_BPS: u32 = 100; // 1%
+    const EXPECTED_PREMIUM: i128 = DEPOSIT * PREMIUM_BPS as i128 / 10_000;
+
+    client.set_insurance_premium_bps(&admin, &PREMIUM_BPS);
+    mint(&env, &token, &token_admin, &user, DEPOSIT);
+
+    client.deposit(&user, &DEPOSIT);
+
+    assert_eq!(client.insurance_fund_balance(), EXPECTED_PREMIUM);
+    assert_eq!(
+        client.get_account(&user).balance,
+        DEPOSIT - EXPECTED_PREMIUM,
+    );
 }

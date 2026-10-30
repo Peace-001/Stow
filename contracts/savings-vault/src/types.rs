@@ -1,4 +1,63 @@
-﻿use soroban_sdk::{contracttype, Address, Map, String, Vec};
+use soroban_sdk::{contracttype, Address, BytesN, Map, String, Vec};
+
+// ---------------------------------------------------------------------------
+// Rewards (new for #440)
+// ---------------------------------------------------------------------------
+
+/// Loyalty-multiplier tier: holds a position for at least `min_seconds` to
+/// earn `multiplier_bps` (10_000 = 1.0×).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct LoyaltyTier {
+    /// Minimum continuous hold time in seconds to qualify.
+    pub min_seconds: u64,
+    /// Reward multiplier in basis points (10_000 = 1.0×).
+    pub multiplier_bps: u32,
+}
+
+/// Admin-configurable rewards parameters.
+///
+/// Stored as a single instance-storage entry under `DataKey::RewardsConfig`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RewardsConfig {
+    /// Annual base reward rate in basis points.
+    pub base_rate_bps: u32,
+    /// How many seconds make one accrual period (e.g. 604_800 = 1 week). Must be > 0.
+    pub accrual_period_seconds: u64,
+    /// Loyalty tiers (sorted ascending by `min_seconds`). Up to 4 tiers.
+    pub loyalty_tiers: Vec<LoyaltyTier>,
+    /// Maximum loyalty multiplier in basis points (≥ 10_000).
+    pub loyalty_cap_bps: u32,
+    /// Extra reward per consecutive kept streak period, in bps of principal.
+    pub streak_bonus_bps_per_period: u32,
+    /// Maximum streak bonus in basis points.
+    pub streak_bonus_cap_bps: u32,
+    /// Length of one streak period in seconds. Must be > 0.
+    pub streak_period_seconds: u64,
+}
+
+/// Per-user reward tracking. Stored as a persistent entry under
+/// `DataKey::RewardState(owner)`.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RewardState {
+    pub owner: Address,
+    /// Rewards accrued but not yet claimed, in token stroops.
+    pub pending: i128,
+    /// Ledger timestamp of the last accrual.
+    pub last_accrued_at: u64,
+    /// Number of consecutive streak periods kept so far.
+    pub streak: u32,
+    /// Ledger timestamp of the start of the current streak period window.
+    pub streak_period_start: u64,
+    /// Whether the current streak period has already been satisfied.
+    pub streak_period_kept: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Existing types
+// ---------------------------------------------------------------------------
 
 /// A flexible savings account: deposit and withdraw any time.
 #[contracttype]
@@ -25,7 +84,7 @@ pub struct LockedPlan {
 
 /// A goal-based savings target with automated milestone tracking.
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Goal {
     pub id: u64,
     pub owner: Address,
@@ -142,7 +201,7 @@ impl CompoundFrequency {
 /// deposit/withdraw. This keeps accrual gas-cheap regardless of how much
 /// time has elapsed.
 #[contracttype]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct InterestAccount {
     pub owner: Address,
     /// Compounded principal: deposits plus interest credited so far.
@@ -159,6 +218,26 @@ pub struct InterestAccount {
     pub frequency: CompoundFrequency,
     pub created_at: u64,
     pub updated_at: u64,
+}
+
+/// A pending upgrade proposal with a timelock delay.
+#[contracttype]
+#[derive(Clone)]
+pub struct UpgradeProposal {
+    pub new_wasm_hash: BytesN<32>,
+    pub proposed_by: Address,
+    pub proposed_at: u64,
+    pub execute_after: u64,
+}
+
+/// An approved insurance claim that a user can redeem.
+#[contracttype]
+#[derive(Clone)]
+pub struct InsuranceClaimRecord {
+    pub claimant: Address,
+    pub amount: i128,
+    pub approved_at: u64,
+    pub redeemed: bool,
 }
 
 /// Storage keys. One variant per logical record family.
@@ -299,28 +378,29 @@ pub enum DataKey {
     GoalContributions(u64),
     /// Ledger sequence of the most recent contribution to a goal.
     GoalLastContributionLedger(u64),
-    /// Set while an external token transfer is in progress.
+    /// Set while an external token transfer is in progress (reentrancy guard).
     TokenTransferActive,
 
-    // ── Issue #430: flexible fee structure ────────────────────────────────
-    /// Protocol fee in basis points (1/100 %). Max 1_000 (10%). Defaults to 0.
-    /// Durability: instance.
-    FeeBps,
-    /// Address that receives protocol fees. Defaults to admin when unset.
-    /// Durability: instance.
-    FeeRecipient,
+    // --- Emergency pause (#428) ---
+    /// Emergency mode flag. When active, only withdrawals are permitted.
+    EmergencyMode,
 
-    // ── Issue #436: multi-token support ────────────────────────────────────
-    /// Whitelist of accepted token addresses. Stored as a Vec<Address>.
-    /// The primary token (set at `initialize`) is always included.
-    /// Durability: instance.
-    TokenWhitelist,
-    /// Per-token flexible balances for a user: Map<token_address, balance>.
-    /// Durability: persistent.
-    TokenBalance(Address),
-    /// Conversion rate from one token to another, in units of 1/1_000_000.
-    /// 1_000_000 = 1:1 parity. Stored per (from, to) pair.
-    /// Durability: instance.
-    ConversionRate(Address, Address),
+    // --- Contract upgrade pattern (#429) ---
+    /// Current contract version number.
+    Version,
+    /// Pending upgrade proposal: stores `UpgradeProposal`.
+    PendingUpgrade,
+    /// Minimum delay (in seconds) before a proposed upgrade can execute.
+    UpgradeDelay,
+
+    // --- Insurance fund (#435) ---
+    /// Insurance fund pool balance.
+    InsuranceFundBalance,
+    /// Insurance premium rate in basis points, collected on deposits.
+    InsurancePremiumBps,
+    /// Maximum claimable amount per user from the insurance fund.
+    InsuranceMaxClaimBps,
+    /// Approved insurance claim by user address.
+    InsuranceClaim(Address),
 }
 

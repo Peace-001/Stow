@@ -46,7 +46,7 @@ pub fn emergency_withdraw_all(env: &Env, caller: Address) -> Result<i128, Error>
     let strategy_id = strategy::active_strategy_id(env).ok_or(Error::StrategyNotFound)?;
     let info = strategy::get_strategy(env, strategy_id)?;
 
-    let deployed = strategy::strategy_balance(env, &info.address);
+    let deployed = strategy::strategy_balance(env, &info.address)?;
     let recovered = if deployed > 0 {
         strategy::withdraw_from_strategy(env, &info.address, deployed)?
     } else {

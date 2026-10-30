@@ -16,7 +16,7 @@
 //! and a `TODO(issue)` describing the work. Each stub is one contributor issue.
 
 mod admin;
-mod challenge;
+mod delegation;
 mod error;
 mod events;
 mod fees;
@@ -24,11 +24,13 @@ mod flexible;
 mod goal;
 mod group;
 mod group_split;
-mod inheritance;
+mod insurance;
 mod interest;
+mod challenge;
 mod locked;
-mod multitoken;
+pub mod rewards;
 mod storage;
+mod timelock;
 mod types;
 mod voting;
 
@@ -39,7 +41,8 @@ use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, Map, String};
 
 use crate::error::Error;
 use crate::types::{
-    CompoundFrequency, FlexibleAccount, Goal, Group, InterestAccount, LockedPlan, Proposal,
+    CompoundFrequency, FlexibleAccount, Goal, Group, InsuranceClaimRecord, InterestAccount,
+    LockedPlan, Proposal, UpgradeProposal,
 };
 
 #[contract]
@@ -148,15 +151,30 @@ impl SavingsVault {
     }
 
     // --- locked ------------------------------------------------------------
-    pub fn locked_create(env: Env, owner: Address, amount: i128, unlock_at: u64) -> Result<u64, Error> {
+    pub fn locked_create(
+        env: Env,
+        owner: Address,
+        amount: i128,
+        unlock_at: u64,
+    ) -> Result<u64, Error> {
         locked::create(&env, owner, amount, unlock_at)
     }
 
-    pub fn locked_top_up(env: Env, owner: Address, plan_id: u64, amount: i128) -> Result<(), Error> {
+    pub fn locked_top_up(
+        env: Env,
+        owner: Address,
+        plan_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
         locked::top_up(&env, owner, plan_id, amount)
     }
 
-    pub fn locked_withdraw(env: Env, owner: Address, plan_id: u64, amount: i128) -> Result<(), Error> {
+    pub fn locked_withdraw(
+        env: Env,
+        owner: Address,
+        plan_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
         locked::withdraw(&env, owner, plan_id, amount)
     }
 
@@ -176,11 +194,21 @@ impl SavingsVault {
     }
 
     // --- goal --------------------------------------------------------------
-    pub fn goal_create(env: Env, owner: Address, name: String, target_amount: i128) -> Result<u64, Error> {
+    pub fn goal_create(
+        env: Env,
+        owner: Address,
+        name: String,
+        target_amount: i128,
+    ) -> Result<u64, Error> {
         goal::create(&env, owner, name, target_amount)
     }
 
-    pub fn goal_contribute(env: Env, from: Address, goal_id: u64, amount: i128) -> Result<(), Error> {
+    pub fn goal_contribute(
+        env: Env,
+        from: Address,
+        goal_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
         goal::contribute(&env, from, goal_id, amount)
     }
 
@@ -216,7 +244,12 @@ impl SavingsVault {
         group::join(&env, member, group_id)
     }
 
-    pub fn group_contribute(env: Env, member: Address, group_id: u64, amount: i128) -> Result<(), Error> {
+    pub fn group_contribute(
+        env: Env,
+        member: Address,
+        group_id: u64,
+        amount: i128,
+    ) -> Result<(), Error> {
         group::contribute(&env, member, group_id, amount)
     }
 
@@ -233,7 +266,12 @@ impl SavingsVault {
     }
 
     // --- group split -------------------------------------------------------
-    pub fn group_set_shares(env: Env, creator: Address, group_id: u64, shares_bps: Map<Address, u32>) -> Result<(), Error> {
+    pub fn group_set_shares(
+        env: Env,
+        creator: Address,
+        group_id: u64,
+        shares_bps: Map<Address, u32>,
+    ) -> Result<(), Error> {
         group_split::set_shares(&env, creator, group_id, shares_bps)
     }
 
@@ -340,96 +378,117 @@ impl SavingsVault {
         interest::accrued(&env, owner)
     }
 
-    // --- flexible fee structure (issue #430) ---------------------------------
+    // --- emergency mode (#428) --------------------------------------------
 
-    /// Return the protocol fee in basis points. Defaults to 0.
-    pub fn fee_bps(env: Env) -> u32 {
-        fees::fee_bps(&env)
+    /// Activate or deactivate emergency mode. Admin-only.
+    /// In emergency mode only withdrawals are permitted.
+    pub fn set_emergency_mode(env: Env, caller: Address, active: bool) -> Result<(), Error> {
+        admin::set_emergency_mode(&env, caller, active)
     }
 
-    /// Set the protocol fee. Admin-only. Max 1_000 bps (10%).
-    pub fn set_fee_bps(env: Env, bps: u32) -> Result<(), Error> {
-        fees::set_fee_bps(&env, bps)
+    /// Whether the contract is in emergency mode.
+    pub fn is_emergency_mode(env: Env) -> bool {
+        admin::is_emergency_mode(&env)
     }
 
-    /// Return the fee recipient address. Defaults to the admin.
-    pub fn fee_recipient(env: Env) -> Result<Address, Error> {
-        fees::fee_recipient(&env)
+    /// Emergency withdrawal from a locked plan. Bypasses the timelock,
+    /// no penalty. Only available during emergency mode.
+    pub fn locked_emergency_withdraw(env: Env, owner: Address, plan_id: u64) -> Result<(), Error> {
+        locked::emergency_withdraw(&env, owner, plan_id)
     }
 
-    /// Set the fee recipient. Admin-only.
-    pub fn set_fee_recipient(env: Env, recipient: Address) -> Result<(), Error> {
-        fees::set_fee_recipient(&env, recipient)
+    // --- contract upgrade pattern (#429) ----------------------------------
+
+    /// The current contract version number.
+    pub fn version(env: Env) -> u32 {
+        admin::version(&env)
     }
 
-    // --- multi-token support (issue #436) ------------------------------------
-
-    /// Return the whitelist of accepted token addresses.
-    pub fn token_whitelist(env: Env) -> soroban_sdk::Vec<Address> {
-        multitoken::get_whitelist(&env)
+    /// The configured upgrade delay in seconds.
+    pub fn upgrade_delay(env: Env) -> u64 {
+        admin::upgrade_delay(&env)
     }
 
-    /// Add a token to the whitelist. Admin-only.
-    pub fn add_token(env: Env, token_addr: Address) -> Result<(), Error> {
-        multitoken::add_token(&env, token_addr)
+    /// Set the minimum delay before a proposed upgrade can execute.
+    pub fn set_upgrade_delay(env: Env, caller: Address, seconds: u64) -> Result<(), Error> {
+        admin::set_upgrade_delay(&env, caller, seconds)
     }
 
-    /// Remove a token from the whitelist. Admin-only.
-    /// The primary vault token cannot be removed.
-    pub fn remove_token(env: Env, token_addr: Address) -> Result<(), Error> {
-        multitoken::remove_token(&env, token_addr)
+    /// Propose an upgrade with a timelock delay.
+    pub fn propose_upgrade(env: Env, caller: Address, new_wasm_hash: BytesN<32>) -> Result<(), Error> {
+        admin::propose_upgrade(&env, caller, new_wasm_hash)
     }
 
-    /// Deposit `amount` of `token_addr` into the caller's multi-token balance.
-    pub fn deposit_token(
+    /// Execute a pending upgrade after the timelock elapses.
+    pub fn execute_upgrade(env: Env, caller: Address) -> Result<(), Error> {
+        admin::execute_upgrade(&env, caller)
+    }
+
+    /// Cancel a pending upgrade.
+    pub fn cancel_upgrade(env: Env, caller: Address) -> Result<(), Error> {
+        admin::cancel_upgrade(&env, caller)
+    }
+
+    /// Read the pending upgrade proposal, if any.
+    pub fn pending_upgrade(env: Env) -> Option<UpgradeProposal> {
+        admin::pending_upgrade(&env)
+    }
+
+    /// Run post-upgrade state migration. Admin-only.
+    pub fn migrate(env: Env, caller: Address) -> Result<(), Error> {
+        admin::migrate(&env, caller)
+    }
+
+    // --- insurance fund (#435) --------------------------------------------
+
+    /// The insurance premium rate in basis points.
+    pub fn insurance_premium_bps(env: Env) -> u32 {
+        insurance::premium_bps(&env)
+    }
+
+    /// Set the insurance premium rate. Admin-only.
+    pub fn set_insurance_premium_bps(env: Env, caller: Address, bps: u32) -> Result<(), Error> {
+        insurance::set_premium_bps(&env, caller, bps)
+    }
+
+    /// The current insurance fund balance.
+    pub fn insurance_fund_balance(env: Env) -> i128 {
+        insurance::fund_balance(&env)
+    }
+
+    /// Add funds to the insurance pool. Admin-only.
+    pub fn insurance_fund(env: Env, caller: Address, amount: i128) -> Result<(), Error> {
+        insurance::fund(&env, caller, amount)
+    }
+
+    /// The maximum per-claim amount in basis points of fund balance.
+    pub fn insurance_max_claim_bps(env: Env) -> u32 {
+        insurance::max_claim_bps(&env)
+    }
+
+    /// Set the maximum per-claim basis points. Admin-only.
+    pub fn set_insurance_max_claim_bps(env: Env, caller: Address, bps: u32) -> Result<(), Error> {
+        insurance::set_max_claim_bps(&env, caller, bps)
+    }
+
+    /// Approve an insurance claim. Admin-only.
+    pub fn insurance_approve_claim(
         env: Env,
-        from: Address,
-        token_addr: Address,
+        caller: Address,
+        claimant: Address,
         amount: i128,
     ) -> Result<(), Error> {
-        multitoken::deposit_token(&env, from, token_addr, amount)
+        insurance::approve_claim(&env, caller, claimant, amount)
     }
 
-    /// Withdraw `amount` of `token_addr` from the caller's multi-token balance.
-    pub fn withdraw_token(
-        env: Env,
-        owner: Address,
-        token_addr: Address,
-        amount: i128,
-    ) -> Result<(), Error> {
-        multitoken::withdraw_token(&env, owner, token_addr, amount)
+    /// Redeem an approved insurance claim.
+    pub fn insurance_redeem_claim(env: Env, claimant: Address) -> Result<i128, Error> {
+        insurance::redeem_claim(&env, claimant)
     }
 
-    /// Get a user's per-token balances.
-    pub fn token_balances(env: Env, owner: Address) -> soroban_sdk::Map<Address, i128> {
-        multitoken::get_token_balances(&env, owner)
-    }
-
-    /// Set the conversion rate between two tokens. Admin-only.
-    /// Rate is in 1/1_000_000 units (1_000_000 = 1:1).
-    pub fn set_conversion_rate(
-        env: Env,
-        from: Address,
-        to: Address,
-        rate: u64,
-    ) -> Result<(), Error> {
-        multitoken::set_conversion_rate(&env, from, to, rate)
-    }
-
-    /// Get the conversion rate between two tokens.
-    pub fn conversion_rate(env: Env, from: Address, to: Address) -> Result<u64, Error> {
-        multitoken::get_conversion_rate(&env, &from, &to)
-    }
-
-    /// Convert `amount` of `from_token` to `to_token` in the caller's balance.
-    pub fn convert_balance(
-        env: Env,
-        owner: Address,
-        from_token: Address,
-        to_token: Address,
-        amount: i128,
-    ) -> Result<i128, Error> {
-        multitoken::convert_balance(&env, owner, from_token, to_token, amount)
+    /// Read an insurance claim record.
+    pub fn insurance_claim(env: Env, claimant: Address) -> Result<InsuranceClaimRecord, Error> {
+        insurance::get_claim(&env, claimant)
     }
 }
 

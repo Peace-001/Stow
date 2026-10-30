@@ -25,9 +25,9 @@
 //!   account drained to zero and abandoned) will eventually hit its
 //!   minimum persistent TTL and become eligible for archival by the
 //!   network; reading an archived entry then requires a `restore` before
-//! the next `get`. [`extend_persistent_ttl`] is called after every read
-//! and write of a `Flexible`, `InterestAccount`, `Locked`, `Goal`, or
-//! `Group` record so a record touched within the bump window never expires.
+//!   the next `get`. [`extend_persistent_ttl`] is called after every read
+//!   and write of a `Flexible`, `InterestAccount`, `Locked`, `Goal`, or
+//!   `Group` record so a record touched within the bump window never expires.
 //!
 //! ## TTL policy
 //!
@@ -72,6 +72,14 @@ pub const PERSISTENT_LIFETIME_THRESHOLD: u32 = PERSISTENT_BUMP_AMOUNT - DAY_IN_L
 
 /// Bump the instance TTL. Call at the top of every state-changing entrypoint.
 pub fn extend_instance_ttl(env: &Env) {
+    if env
+        .storage()
+        .instance()
+        .get::<_, bool>(&DataKey::TokenTransferActive)
+        .unwrap_or(false)
+    {
+        soroban_sdk::panic_with_error!(env, Error::ReentrantCall);
+    }
     env.storage()
         .instance()
         .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
@@ -81,6 +89,14 @@ pub fn extend_instance_ttl(env: &Env) {
 /// `Flexible`, `InterestAccount`, `Locked`, `Goal`, or `Group` record so it
 /// does not become eligible for archival between touches.
 pub fn extend_persistent_ttl(env: &Env, key: &DataKey) {
+    if env
+        .storage()
+        .instance()
+        .get::<_, bool>(&DataKey::TokenTransferActive)
+        .unwrap_or(false)
+    {
+        soroban_sdk::panic_with_error!(env, Error::ReentrantCall);
+    }
     env.storage().persistent().extend_ttl(
         key,
         PERSISTENT_LIFETIME_THRESHOLD,
@@ -131,8 +147,10 @@ pub fn transfer_in(env: &Env, from: &Address, amount: i128) -> Result<(), Error>
         return Err(Error::InvalidAmount);
     }
     let token_address = get_token(env).ok_or(Error::NotInitialized)?;
+    begin_token_transfer(env)?;
     let token_client = token::Client::new(env, &token_address);
     token_client.transfer(from, &env.current_contract_address(), &amount);
+    end_token_transfer(env);
     Ok(())
 }
 
@@ -145,7 +163,29 @@ pub fn transfer_out(env: &Env, to: &Address, amount: i128) -> Result<(), Error> 
         return Err(Error::InvalidAmount);
     }
     let token_address = get_token(env).ok_or(Error::NotInitialized)?;
+    begin_token_transfer(env)?;
     let token_client = token::Client::new(env, &token_address);
     token_client.transfer(&env.current_contract_address(), to, &amount);
+    end_token_transfer(env);
     Ok(())
+}
+
+pub(crate) fn begin_token_transfer(env: &Env) -> Result<(), Error> {
+    let key = DataKey::TokenTransferActive;
+    if env
+        .storage()
+        .instance()
+        .get::<_, bool>(&key)
+        .unwrap_or(false)
+    {
+        return Err(Error::ReentrantCall);
+    }
+    env.storage().instance().set(&key, &true);
+    Ok(())
+}
+
+pub(crate) fn end_token_transfer(env: &Env) {
+    env.storage()
+        .instance()
+        .set(&DataKey::TokenTransferActive, &false);
 }
